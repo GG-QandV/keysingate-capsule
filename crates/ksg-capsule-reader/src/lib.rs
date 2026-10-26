@@ -7,6 +7,8 @@
 //!
 //! Skeleton of 26.10: the engine and the session land on 30.10 (plan v8, K5).
 
+pub mod side;
+
 use std::io::Write as _;
 use std::path::Path;
 
