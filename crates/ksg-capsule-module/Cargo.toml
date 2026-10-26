@@ -1,0 +1,29 @@
+[package]
+name = "ksg-capsule-module"
+description = "The container's code as a WebAssembly module inside the capsule: a session of presses, randomness and time from the reader ([doc:CAPSULE-SPEC] §10 p. 3)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license-file           = "../../LICENSE-PROPRIETARY"
+publish                = false
+repository.workspace   = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ksg-container-v2 = { path = "../ksg-container-v2" }
+
+[lints.rust]
+missing_docs = "warn"
+# The module's boundary is raw memory: exported functions and the two host
+# imports. `unsafe` is allowed in `abi.rs` alone and denied everywhere else.
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Inside the capsule the container's randomness is the reader's (`ksg_host.random`):
+# the module registers it as getrandom's custom source (Spec_kapsula §5).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["custom"] }

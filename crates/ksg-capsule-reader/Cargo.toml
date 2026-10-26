@@ -1,0 +1,19 @@
+[package]
+name = "ksg-capsule-reader"
+description = "The capsule's reader: no secrets of its own; opens its party's slot and the code, runs the module, does the network and the signatures outside ([doc:CAPSULE-SPEC] §5, §10 p. 3)"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license-file           = "../../LICENSE-PROPRIETARY"
+publish                = false
+repository.workspace   = true
+
+[dependencies]
+ksg-container-v2 = { path = "../ksg-container-v2" }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
