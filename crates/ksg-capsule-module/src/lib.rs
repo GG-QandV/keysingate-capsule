@@ -10,9 +10,9 @@
 //! | `ksg_close` | the new capsule and the outputs; the module wipes its memory |
 //!
 //! The module imports **only** `ksg_host.random` and `ksg_host.now_ms`: no
-//! files, no network (criterion K4).
+//! files, no network (criterion K4 — tested by `tests/k4_imports.rs`).
 //!
-//! Skeleton of 26.10; the session lands on 29.10 (plan v8).
+//! Skeleton of 26.10; the session and the boundary landed 27.10 (plan v8, K4).
 
 pub mod abi;
 pub mod session;

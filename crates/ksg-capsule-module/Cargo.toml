@@ -13,6 +13,22 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 ksg-container-v2 = { path = "../ksg-container-v2" }
+ksg-core-v2 = { path = "../ksg-core-v2" }
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+# The map's public halves are rebuilt from the capsule into a `SealTo`
+# (`ksg_container_v2::layers`), and the FROST rounds take `rand_core`'s traits.
+x25519-dalek.workspace = true
+rand_core = { version = "0.6" }
+# Outside the capsule the operating system is the CSPRNG; inside it, the
+# reader's `ksg_host.random` is (see the wasm32 section below).
+getrandom = "0.2"
+
+[dev-dependencies]
+# The K4 test parses the built module's import section.
+wasmparser = "0.221"
 
 [lints.rust]
 missing_docs = "warn"
