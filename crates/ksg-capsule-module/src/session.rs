@@ -660,7 +660,7 @@ impl Session {
                 }
             }
         };
-        let (mobile, public, fin) = match keygen.finish(&reply) {
+        let (mut mobile, mut public, fin) = match keygen.finish(&reply) {
             Ok(x) => x,
             Err(e) => {
                 self.container.cancel_birth();
@@ -669,6 +669,26 @@ impl Session {
                 };
             }
         };
+        // Г-1: the client agent is named by the `did:key` of the group key it
+        // is half of — the same name a verifier computes. The key exists only
+        // now; nothing has been signed under it yet.
+        let named = match ksg_core_v2::crypto::did_key::kid(&public) {
+            Ok(k) => k,
+            Err(e) => {
+                self.container.cancel_birth();
+                return Answer::Refused {
+                    reason: format!("the client's did:key: {e}"),
+                };
+            }
+        };
+        mobile.set_kid(named.clone());
+        public.kid = named.clone();
+        if let Err(e) = self.container.name_birth(named.clone()) {
+            self.container.cancel_birth();
+            return Answer::Refused {
+                reason: format!("the container does not take the name: {e}"),
+            };
+        }
         let offset_ms = self.tick();
         let (born, id) = match self
             .container
@@ -689,6 +709,7 @@ impl Session {
             };
         }
         self.mobile = Some(mobile);
+        self.client_kid = named;
         self.pending_birth = true;
         let pressed = self.press(
             Operation::Initiate,
