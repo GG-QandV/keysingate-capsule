@@ -101,6 +101,18 @@ pub fn anchor(subject: Hash) -> Attestation {
     }
 }
 
+/// A network's attestation for a subject named by its multihash — what the
+/// reader hands back in through `Reanchor` in the tests. The module checks
+/// the subject, not the kind: a test attestation stands in for the network's.
+pub fn attestation_for(subject_multihash: &str) -> Attestation {
+    Attestation {
+        kind: uri("urn:ksg:anchor:test"),
+        subject: Hash::from_multihash(subject_multihash).expect("a multihash"),
+        proof: b"test".to_vec(),
+        anchored_at: ts("2026-09-12T00:00:00.000Z"),
+    }
+}
+
 /// The parties a test needs: the issuer's word and the owner's signature.
 pub struct Parties {
     /// The issuer signs the status records and lays the packet.
@@ -149,7 +161,7 @@ impl Fixture {
     /// A light container, initiated, with page 0 written.
     #[must_use]
     pub fn started() -> Self {
-        let mut f = Self::printed(Parties::new(), TestRng(7));
+        let mut f = Self::printed(Class::Light, Parties::new(), TestRng(7));
         f.press_packet();
         f.press_buyer_key();
         f.press_initiate();
@@ -157,7 +169,20 @@ impl Fixture {
         f
     }
 
-    fn printed(parties: Parties, rng: TestRng) -> Self {
+    /// A heavy (Pro) container, initiated, with page 0 written: page 0
+    /// carries the owner's seal and a placeholder anchor (CH-26), the status
+    /// records their placeholder anchors.
+    #[must_use]
+    pub fn started_heavy() -> Self {
+        let mut f = Self::printed(Class::Heavy, Parties::new(), TestRng(7));
+        f.press_packet();
+        f.press_buyer_key();
+        f.press_initiate();
+        f.press_opening();
+        f
+    }
+
+    fn printed(class: Class, parties: Parties, rng: TestRng) -> Self {
         let mut rng = rng;
         let (inside, mobile) = split(client_kid(), &mut rng).expect("the client's key splits");
         let client = inside.public().clone();
@@ -201,7 +226,7 @@ impl Fixture {
         let release = Release {
             id: EMISSION.into(),
             issued_at,
-            class: Class::Light,
+            class,
         };
         let pq = ksg_container_v2::pq_key::ContainerPqKey::generate(
             uri("did:key:zContainer#pq"),
@@ -314,13 +339,21 @@ impl Fixture {
             Page::None => None,
             Page::Opening => {
                 let offset_ms = self.tick();
-                let (bytes, _hash) = self.container.opening_seal(offset_ms).expect("page 0");
+                let (bytes, hash) = self.container.opening_seal(offset_ms).expect("page 0");
+                let mut sealing = Sealing {
+                    seal: SignatureSet::new(self.client_signs(&bytes)),
+                    ..Sealing::default()
+                };
+                // CH-26: page 0 of a Pro journal carries the owner's seal
+                // and an anchor. The stand's placeholder stands in for the
+                // network's attestation here, as the module's does inside.
+                if self.container.opening_form() == ksg_core_v2::journal::Mode::Pro {
+                    sealing.owner = Some(SignatureSet::new(vec![self.parties.owner.sign(&bytes)]));
+                    sealing.anchor = Some(anchor(hash));
+                }
                 Some(JournalWrite::Open {
                     offset_ms,
-                    sealing: Box::new(Sealing {
-                        seal: SignatureSet::new(self.client_signs(&bytes)),
-                        ..Sealing::default()
-                    }),
+                    sealing: Box::new(sealing),
                 })
             }
         };
