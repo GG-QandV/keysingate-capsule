@@ -48,7 +48,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine as _;
-use ksg_container_v2::capsule::{self, MapRole, Part, PartKind};
+use ksg_container_v2::capsule::{self, MapPub, MapRole, Part, PartKind, Shared};
 use ksg_container_v2::client_key::{share_commitment, MobileHalf};
 use ksg_container_v2::container::{Container, Evidence, JournalWrite, Writes};
 use ksg_container_v2::layers::{OpenWith, SealTo, MLKEM_EK_LEN};
@@ -101,6 +101,16 @@ pub enum Request {
     Reanchor {
         /// The attestation's JSON, as the reader read it from the network.
         attestation: Vec<u8>,
+    },
+    /// E-5: the journal is open — page 0, sealed by the client's two halves.
+    OpenJournal,
+    /// The other party's signature over exactly the bytes a
+    /// [`Answer::NeedsSignature`] handed out (Л-1: signatures are the
+    /// reader's work). The JSON of a `ksg_core_v2::crypto::sign::Signature`;
+    /// the container checks it when the pending command is pressed.
+    Sign {
+        /// The signature's JSON.
+        signature: Vec<u8>,
     },
 }
 
@@ -174,40 +184,6 @@ struct SideFile {
     scan: String,
 }
 
-/// The `SharedSecrets` part: what both maps must read to carry the capsule on.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Shared {
-    /// Version of this layout.
-    v: u32,
-    /// The key the container's state is sealed under, base64url (32 bytes).
-    state_key: String,
-    /// The container's template identifier, as a multihash.
-    template: String,
-    /// The artefact the container was initiated on.
-    artifact: String,
-    /// The client's key identifier, for the birth (E-4).
-    client: String,
-    /// The wall clock of the issuance, milliseconds since the Unix epoch:
-    /// the offsets in the journal run from it.
-    issued_ms: u64,
-    /// The greatest offset already used: offsets grow strictly, even when the
-    /// wall clock does not.
-    clock_ms: u64,
-    /// Every map the capsule seals to, in slot order (`Spec_kapsula` §10 п. 2).
-    maps: Vec<MapPub>,
-}
-
-/// One map's public halves, enough to re-seal its slot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MapPub {
-    /// `holder`, `client` or `owner`.
-    role: String,
-    /// The X25519 public half, base64url (32 bytes).
-    x25519: String,
-    /// The ML-KEM-768 encapsulation key, base64url.
-    mlkem: String,
-}
-
 /// The randomness of the module: the reader's CSPRNG inside the capsule
 /// (`ksg_host.random`, §5), the operating system's outside it.
 struct CspRng;
@@ -264,6 +240,17 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Which page a press writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PageToWrite {
+    /// No page.
+    None,
+    /// Page 0, the opening.
+    Opening,
+    /// A record of this kind, with this content.
+    Record(RecordKind, Piece),
+}
+
 /// One opened capsule with the container in memory: one session per module
 /// instance (`Spec_kapsula` §10 п. 3).
 ///
@@ -307,6 +294,9 @@ pub struct Session {
     /// The bytes the owner signs for that pending initiation, if one waits for
     /// the owner's signature: a second [`Request::Initiate`] answers the same.
     pending_bytes: Vec<u8>,
+    /// The other party's signature over [`Session::pending_bytes`], handed in
+    /// by [`Request::Sign`] while a birth waits for it.
+    pending_owner: Option<Signature>,
 }
 
 impl Session {
@@ -390,7 +380,7 @@ impl Session {
         let client_kid =
             Uri::parse(shared.client.clone()).map_err(|e| format!("client kid: {e}"))?;
 
-        let mobile = if side.half.is_empty() {
+        let mobile = if side.half.is_empty() || side.role != SideRole::Client {
             None
         } else {
             let bytes = B64
@@ -424,6 +414,7 @@ impl Session {
             owner,
             pending_birth: false,
             pending_bytes: Vec::new(),
+            pending_owner: None,
         };
         for (i, raw) in anchored.iter().enumerate() {
             let attestation: Attestation =
@@ -446,7 +437,9 @@ impl Session {
     /// | [`Request::Work`] | `{"pages": n, "seal": "<multihash>"}` |
     /// | [`Request::ExportPage`] | the page as JSON, as `ksg-verify-v2` reads it — the same bytes the session keeps in its outputs |
     /// | [`Request::Initiate`] | `{"container": "<multihash>", "mobile_half": "<base64url>", "share_commitment": "<base64url>"}` |
+    /// | [`Request::OpenJournal`] | `{"pages": n, "seal": "<multihash>"}` |
     /// | [`Request::Reanchor`] | empty |
+    /// | [`Request::Sign`] | the same as the command whose signature was missing |
     pub fn call(&mut self, request: Request) -> Answer {
         match request {
             Request::Status => Answer::Done {
@@ -457,6 +450,8 @@ impl Session {
             Request::ExportPage { number } => self.export_page(number),
             Request::Initiate => self.initiate(),
             Request::Reanchor { attestation } => self.reanchor(&attestation),
+            Request::OpenJournal => self.open_journal(),
+            Request::Sign { signature } => self.sign_pending(&signature),
         }
     }
 
@@ -496,41 +491,20 @@ impl Session {
             .container
             .seal_to_bytes(&self.state_key, &mut rng)
             .map_err(|e| format!("the state does not seal: {e}"))?;
-        let shared = Shared {
-            v: 1,
-            state_key: B64.encode(self.state_key.as_ref()),
-            template: self.template.to_multihash(),
-            artifact: self.artifact.as_str().to_string(),
-            client: self.client_kid.as_str().to_string(),
-            issued_ms: self.issued_ms,
-            clock_ms: self.clock_ms,
-            maps: self
-                .maps
-                .iter()
-                .map(|(role, map)| MapPub {
-                    role: map_role_name(*role).to_string(),
-                    x25519: B64.encode(map.public().as_bytes()),
-                    mlkem: B64.encode(map.mlkem()),
-                })
-                .collect(),
-        };
-        let shared = serde_json::to_vec(&shared).map_err(|e| format!("shared secrets: {e}"))?;
-        let mut parts = self.parts.clone();
-        parts.push(Part {
-            kind: PartKind::Code,
-            bytes: self.code.clone(),
-        });
-        parts.push(Part {
-            kind: PartKind::State,
-            bytes: state,
-        });
-        parts.push(Part {
-            kind: PartKind::SharedSecrets,
-            bytes: shared,
-        });
         let mut fill = |out: &mut [u8]| rng.fill_bytes(out);
-        let capsule = capsule::assemble(&parts, &self.maps, &mut fill)
-            .map_err(|e| format!("the capsule does not assemble: {e}"))?;
+        let capsule = seal_parts(
+            &state,
+            &self.state_key,
+            self.template,
+            self.artifact.as_str(),
+            self.client_kid.as_str(),
+            self.issued_ms,
+            self.clock_ms,
+            &self.code,
+            &self.parts,
+            &self.maps,
+            &mut fill,
+        )?;
         Ok((capsule, self.outputs.clone()))
     }
 
@@ -592,7 +566,7 @@ impl Session {
                 order: None,
                 work: Box::new(work),
             },
-            Some((RecordKind::Work, Piece::Inline(text.as_bytes().to_vec()))),
+            PageToWrite::Record(RecordKind::Work, Piece::Inline(text.as_bytes().to_vec())),
         ) {
             Ok(()) => Answer::Done {
                 bytes: serde_json::json!({
@@ -622,7 +596,7 @@ impl Session {
             Operation::ExportPoint,
             &[party],
             &Evidence::Point { number },
-            None,
+            PageToWrite::None,
         ) {
             return answer;
         }
@@ -714,54 +688,16 @@ impl Session {
                 reason: "the two sides of the birth hold halves of different keys".into(),
             };
         }
-        let share = match mobile.share_public() {
-            Ok(s) => s,
-            Err(e) => {
-                self.container.cancel_birth();
-                return Answer::Refused {
-                    reason: format!("the half has no public share: {e}"),
-                };
-            }
-        };
-        // E-19: the commitment to the mobile half — the reader anchors it.
-        let commitment = share_commitment(&share);
-        let half = match mobile.to_bytes() {
-            Ok(b) => b,
-            Err(e) => {
-                self.container.cancel_birth();
-                return Answer::Refused {
-                    reason: format!("the half does not encode: {e}"),
-                };
-            }
-        };
         self.mobile = Some(mobile);
         self.pending_birth = true;
         let pressed = self.press(
             Operation::Initiate,
             &[Party::Client, Party::Owner],
             &Evidence::Initiation { at: Where::Inside },
-            None,
+            PageToWrite::None,
         );
         match pressed {
-            Ok(()) => {
-                self.pending_birth = false;
-                self.outputs.push(half.to_vec());
-                let owned = self.owner.is_some();
-                if owned {
-                    // The owner pressed the initiation: the client's half is
-                    // the client's, and this session forgets it at once.
-                    self.mobile = None;
-                }
-                Answer::Done {
-                    bytes: serde_json::json!({
-                        "container": id.to_multihash(),
-                        "mobile_half": B64.encode(half.as_slice()),
-                        "share_commitment": B64.encode(commitment),
-                    })
-                    .to_string()
-                    .into_bytes(),
-                }
-            }
+            Ok(()) => self.birth_done(id),
             Err(Answer::NeedsSignature { bytes, .. }) => {
                 self.pending_bytes = bytes;
                 Answer::NeedsSignature {
@@ -776,6 +712,141 @@ impl Session {
                 self.container.cancel_birth();
                 self.pending_birth = false;
                 self.mobile = None;
+                refused
+            }
+        }
+    }
+
+    /// The bookkeeping of a pressed birth: the client's half goes to the
+    /// reader, and the session forgets it when the owner's file is the one
+    /// that pressed (the half is the client's).
+    fn birth_done(&mut self, id: Hash) -> Answer {
+        let Some(mobile) = self.mobile.take() else {
+            return Answer::Refused {
+                reason: "the birth was pressed, but the session holds no half".into(),
+            };
+        };
+        let share = match mobile.share_public() {
+            Ok(s) => s,
+            Err(e) => {
+                return Answer::Refused {
+                    reason: format!("the half has no public share: {e}"),
+                }
+            }
+        };
+        // E-19: the commitment to the mobile half — the reader anchors it.
+        let commitment = share_commitment(&share);
+        let half = match mobile.to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                return Answer::Refused {
+                    reason: format!("the half does not encode: {e}"),
+                };
+            }
+        };
+        self.pending_birth = false;
+        self.pending_owner = None;
+        self.outputs.push(half.to_vec());
+        if self.owner.is_some() {
+            // The owner pressed the initiation: the client's half is the
+            // client's, and this session forgets it at once.
+            self.mobile = None;
+        } else {
+            self.mobile = Some(mobile);
+        }
+        Answer::Done {
+            bytes: serde_json::json!({
+                "container": id.to_multihash(),
+                "mobile_half": B64.encode(half.as_slice()),
+                "share_commitment": B64.encode(commitment),
+            })
+            .to_string()
+            .into_bytes(),
+        }
+    }
+
+    /// E-5: the journal opens — page 0, sealed by the client's two halves.
+    fn open_journal(&mut self) -> Answer {
+        if !self.container.born() {
+            return Answer::Refused {
+                reason: "the container is not initiated: the journal opens after E-4".into(),
+            };
+        }
+        match self.press(
+            Operation::OpenJournal,
+            &[Party::Client],
+            &Evidence::None,
+            PageToWrite::Opening,
+        ) {
+            Ok(()) => Answer::Done {
+                bytes: serde_json::json!({
+                    "pages": self.container.pages(),
+                    "seal": self.container.top_seal_hash().map(|h| h.to_multihash()),
+                })
+                .to_string()
+                .into_bytes(),
+            },
+            Err(answer) => answer,
+        }
+    }
+
+    /// Page 0: the opening's seal, signed by the client's two halves.
+    fn opening_page(&mut self) -> Result<Option<JournalWrite>, Answer> {
+        let offset_ms = self.tick();
+        let (bytes, _hash) = self
+            .container
+            .opening_seal(offset_ms)
+            .map_err(|e| Answer::Refused {
+                reason: format!("the opening does not seal: {e}"),
+            })?;
+        let seal = self.sign_client(&bytes)?;
+        Ok(Some(JournalWrite::Open {
+            offset_ms,
+            sealing: Box::new(Sealing {
+                seal: SignatureSet::new(seal),
+                ..Sealing::default()
+            }),
+        }))
+    }
+
+    /// The other party's signature over the bytes a [`Answer::NeedsSignature`]
+    /// handed out: the pending command is pressed with it (Л-1 — the
+    /// signature is made outside the module, the check is inside).
+    fn sign_pending(&mut self, raw: &[u8]) -> Answer {
+        if !self.pending_birth {
+            return Answer::Refused {
+                reason: "nothing waits for a signature".into(),
+            };
+        }
+        let signature: Signature = match serde_json::from_slice(raw) {
+            Ok(s) => s,
+            Err(e) => {
+                return Answer::Refused {
+                    reason: format!("the signature does not read: {e}"),
+                }
+            }
+        };
+        self.pending_owner = Some(signature);
+        let pressed = self.press(
+            Operation::Initiate,
+            &[Party::Client, Party::Owner],
+            &Evidence::Initiation { at: Where::Inside },
+            PageToWrite::None,
+        );
+        match pressed {
+            Ok(()) => {
+                let id = *self.container.id();
+                self.birth_done(id)
+            }
+            Err(Answer::NeedsSignature { bytes, .. }) => {
+                self.pending_bytes = bytes;
+                Answer::NeedsSignature {
+                    party: Party::Owner.name().into(),
+                    bytes: self.pending_bytes.clone(),
+                }
+            }
+            Err(refused) => {
+                self.pending_owner = None;
                 refused
             }
         }
@@ -848,8 +919,15 @@ impl Session {
             })
     }
 
-    /// The owner signs with its own key.
+    /// The owner signs with its own key — or, while a command waits for the
+    /// other party, with the signature the reader handed in
+    /// ([`Request::Sign`]) over exactly the bytes it was asked for.
     fn sign_owner(&self, msg: &[u8]) -> Result<Signature, Answer> {
+        if let Some(signature) = &self.pending_owner {
+            if msg == self.pending_bytes.as_slice() {
+                return Ok(signature.clone());
+            }
+        }
         match &self.owner {
             Some(signer) => Ok(signer.sign(msg)),
             None => Err(self.missing(Party::Owner, msg)),
@@ -883,7 +961,7 @@ impl Session {
         op: Operation,
         who: &[Party],
         evidence: &Evidence,
-        page: Option<(RecordKind, Piece)>,
+        page: PageToWrite,
     ) -> Result<(), Answer> {
         let mut event = Event {
             op,
@@ -920,9 +998,11 @@ impl Session {
     }
 
     /// The page a command writes, sealed the way its parties do (CH-29).
-    fn page(&mut self, spec: Option<(RecordKind, Piece)>) -> Result<Option<JournalWrite>, Answer> {
-        let Some((kind, content)) = spec else {
-            return Ok(None);
+    fn page(&mut self, spec: PageToWrite) -> Result<Option<JournalWrite>, Answer> {
+        let (kind, content) = match spec {
+            PageToWrite::None => return Ok(None),
+            PageToWrite::Opening => return self.opening_page(),
+            PageToWrite::Record(kind, content) => (kind, content),
         };
         let offset_ms = self.tick();
         let draft = self
@@ -1020,6 +1100,38 @@ impl Session {
     }
 }
 
+/// A session's close: the shared secrets part, the code, the state, the parts
+/// this map does not rewrite (`capsule::seal_into_capsule`).
+#[allow(clippy::too_many_arguments)]
+fn seal_parts(
+    state: &[u8],
+    state_key: &[u8; 32],
+    template: Hash,
+    artifact: &str,
+    client: &str,
+    issued_ms: u64,
+    clock_ms: u64,
+    code: &[u8],
+    parts: &[Part],
+    maps: &[(MapRole, SealTo)],
+    fill: &mut dyn FnMut(&mut [u8]),
+) -> Result<Vec<u8>, String> {
+    capsule::seal_into_capsule(
+        state,
+        state_key,
+        &template.to_multihash(),
+        artifact,
+        client,
+        issued_ms,
+        clock_ms,
+        code,
+        parts,
+        maps,
+        fill,
+    )
+    .map_err(|e| format!("the capsule does not assemble: {e}"))
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         // The halves wipe themselves; the state key goes here, in one place a
@@ -1083,15 +1195,6 @@ const fn side_role_name(role: SideRole) -> &'static str {
     match role {
         SideRole::Client => "client",
         SideRole::Owner => "owner",
-    }
-}
-
-/// A map's role as [`Shared`] spells it.
-const fn map_role_name(role: MapRole) -> &'static str {
-    match role {
-        MapRole::Holder => "holder",
-        MapRole::Client => "client",
-        MapRole::Owner => "owner",
     }
 }
 

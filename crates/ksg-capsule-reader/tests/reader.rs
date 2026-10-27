@@ -1,4 +1,6 @@
-//! The reader's criteria (plan v8): atomic write (Р-6) now; K4 and K5 later.
+//! The reader's own criteria: the atomic write (Р-6) and the side file.
+//! K4 is the module's (`ksg-capsule-module/tests/k4_imports.rs`), K5 is
+//! `tests/k5_offline.rs`.
 
 use ksg_capsule_reader::write_capsule;
 
@@ -12,18 +14,6 @@ fn a_capsule_is_replaced_whole() {
     assert_eq!(std::fs::read(&path).unwrap(), vec![2u8; 4096]);
     assert!(!path.with_extension("tmp").exists());
     std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-#[ignore = "capsule skeleton 26.10: the module lands 29.10 (plan v8, K4)"]
-fn k4_the_module_imports_randomness_and_time_only() {
-    panic!("build the module for wasm32 and list its imports: only ksg_host.random, ksg_host.now_ms");
-}
-
-#[test]
-#[ignore = "capsule skeleton 26.10: the reader lands 30.10 (plan v8, K5)"]
-fn k5_a_pro_page_through_the_capsule_verifies() {
-    panic!("initiate → work ×3 → export → ksg-verify-v2 ACCEPTED; a tampered page REJECTED");
 }
 
 #[test]

@@ -6,7 +6,7 @@
 //! | Export | What it does |
 //! |---|---|
 //! | `ksg_open` | the capsule, the party's secret file, the anchored commands addressed to the container |
-//! | `ksg_call` | one panel-level request: `initiate`, `work`, `export_page`, `keys`, `status`, `reanchor`; an answer, or "the network is needed" / "a party's signature is needed" |
+//! | `ksg_call` | one panel-level request: `initiate`, `open_journal`, `work`, `export_page`, `keys`, `status`, `reanchor`, `sign`; an answer, or "the network is needed" / "a party's signature is needed" |
 //! | `ksg_close` | the new capsule and the outputs; the module wipes its memory |
 //!
 //! The module imports **only** `ksg_host.random` and `ksg_host.now_ms`: no

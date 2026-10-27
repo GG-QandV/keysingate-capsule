@@ -105,7 +105,16 @@ impl SideFile {
     /// Missing, unreadable, or not a side file of version 1.
     pub fn read(path: &Path) -> Result<Self, String> {
         let bytes = Zeroizing::new(std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?);
-        let f: Self = serde_json::from_slice(&bytes).map_err(|e| format!("side file: {e}"))?;
+        Self::from_json(&bytes)
+    }
+
+    /// Reads a side file from the bytes the reader hands the module.
+    ///
+    /// # Errors
+    ///
+    /// Not JSON, or not a side file of version 1.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        let f: Self = serde_json::from_slice(bytes).map_err(|e| format!("side file: {e}"))?;
         if f.v != 1 {
             return Err(format!("side file: version {} is not 1", f.v));
         }

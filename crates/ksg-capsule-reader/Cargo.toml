@@ -8,12 +8,37 @@ license-file           = "../../LICENSE-PROPRIETARY"
 publish                = false
 repository.workspace   = true
 
+[lib]
+name = "ksg_capsule_reader"
+
+[[bin]]
+name = "ksg-capsule"
+path = "src/main.rs"
+
 [dependencies]
 ksg-container-v2 = { path = "../ksg-container-v2" }
+ksg-core-v2 = { path = "../ksg-core-v2" }
+# The wire of the boundary and the wire types of the session (open/call/close).
+ksg-capsule-module = { path = "../ksg-capsule-module" }
+# The stand's print (`init`) and the owner's file: the capsule is the same
+# container, printed by the issuer's desk.
+ksg-cli-v2 = { path = "../ksg-cli-v2" }
+# The engine: the latest stable wasmtime compatible with the pinned toolchain.
+wasmtime = { version = "47.0.4", default-features = false, features = ["cranelift", "runtime"] }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
+hex.workspace = true
 zeroize.workspace = true
+# `OsRng` is what `ksg_host.random` fills the module with.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[dev-dependencies]
+# K5: the export is checked by the verifier itself, not by a copy of its rules.
+ksg-verify-v2 = { path = "../ksg-verify-v2", default-features = false }
+# The test stand's container: the module's own kit is private, so the reader's
+# K5 test prints through the stand exactly as `init` does.
+ksg-capsule-module = { path = "../ksg-capsule-module" }
 
 [lints.rust]
 missing_docs = "warn"
