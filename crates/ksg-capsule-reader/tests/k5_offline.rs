@@ -10,8 +10,9 @@
 //! ```
 //!
 //! The test reads `target/wasm32-unknown-unknown/release/ksg_capsule_module.wasm`
-//! (or `KSG_CAPSULE_WASM`); without it the test says so and returns — a machine
-//! without the artifact proves nothing about the capsule.
+//! (or `KSG_CAPSULE_WASM`); without it the test **fails** — a machine without the
+//! artifact proves nothing about the capsule. A machine that cannot build the
+//! module says so on purpose: `KSG_SKIP_K5=1`.
 
 use ksg_capsule_reader::flow::{self, default_wasm, Layout, Party, Print};
 use ksg_capsule_reader::side::{Role, SideFile};
@@ -28,19 +29,29 @@ fn home(name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// The module's bytes, or `None` when it was never built.
+/// The module's bytes, or `None` when the run skips K5 on purpose.
+///
+/// A missing module fails the test: a green run of a machine that never built
+/// the module would prove nothing about the capsule. `KSG_SKIP_K5=1` is the one
+/// deliberate way to say "this machine cannot build wasm32".
 fn wasm() -> Option<std::path::PathBuf> {
     let path = std::env::var("KSG_CAPSULE_WASM").map_or_else(|_| default_wasm(), std::path::PathBuf::from);
     if path.exists() {
-        Some(path)
-    } else {
+        return Some(path);
+    }
+    if std::env::var("KSG_SKIP_K5").as_deref() == Ok("1") {
         eprintln!(
-            "K5 is not checked: {} is missing — build the module for wasm32 first \
-             (cargo build -p ksg-capsule-module --target wasm32-unknown-unknown --release)",
+            "K5 is skipped on purpose (KSG_SKIP_K5=1): {} is missing",
             path.display()
         );
-        None
+        return None;
     }
+    panic!(
+        "K5 cannot run: {} is missing — build the module for wasm32 first \
+         (cargo build -p ksg-capsule-module --target wasm32-unknown-unknown --release), \
+         or set KSG_SKIP_K5=1 to skip K5 on purpose",
+        path.display()
+    );
 }
 
 /// A capsule is one size, always.
