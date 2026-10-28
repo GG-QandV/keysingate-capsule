@@ -107,6 +107,32 @@ impl Layout {
     }
 }
 
+/// Reads the holder's map seed and scan key before initiation (К3: still
+/// the stand's copy — the issuer's press. The module will born them at E-4
+/// (`BeginBirth`/`FinishBirth`); then this helper goes away and `init`
+/// writes placeholders instead).
+///
+/// # Errors
+///
+/// The stand carries no `layer.key`/`scan.key`, or they do not read.
+fn holder_map_and_scan(layout: &Layout) -> Result<([u8; 32], [u8; 32]), String> {
+    let layer = Zeroizing::new(
+        std::fs::read(layout.stand().join("layer.key"))
+            .map_err(|e| format!("layer.key: {e}"))?,
+    );
+    let map: [u8; 32] = layer
+        .as_slice()
+        .try_into()
+        .map_err(|_| "layer.key: not 32 bytes".to_string())?;
+    let scan_text = std::fs::read_to_string(layout.stand().join("scan.key"))
+        .map_err(|e| format!("scan.key: {e}"))?;
+    let scan: [u8; 32] = hex::decode(scan_text.trim())
+        .map_err(|_| "scan.key: not hex".to_string())?
+        .try_into()
+        .map_err(|_| "scan.key: not 32 bytes".to_string())?;
+    Ok((map, scan))
+}
+
 /// What `init` prints.
 #[derive(Debug, Clone)]
 pub struct Print {
@@ -203,20 +229,13 @@ pub fn init(layout: &Layout, print: &Print) -> Result<String, String> {
     write_capsule(&layout.capsule(), &capsule)?;
 
     // The map's seed before initiation: the holder's layer key (§4).
-    let layer = Zeroizing::new(
-        std::fs::read(layout.stand().join("layer.key"))
-            .map_err(|e| format!("layer.key: {e}"))?,
-    );
-    let map: [u8; 32] = layer
-        .as_slice()
-        .try_into()
-        .map_err(|_| "layer.key: not 32 bytes".to_string())?;
-    let scan_text = std::fs::read_to_string(layout.stand().join("scan.key"))
-        .map_err(|e| format!("scan.key: {e}"))?;
-    let scan: [u8; 32] = hex::decode(scan_text.trim())
-        .map_err(|_| "scan.key: not hex".to_string())?
-        .try_into()
-        .map_err(|_| "scan.key: not 32 bytes".to_string())?;
+    let (map, _) = holder_map_and_scan(layout)?;
+    // K4: the client's scan key is born at the recipient's at E-4
+    // (`initiate` rewrites `file.scan` with `fresh_scan_seed()`, flow.rs:516;
+    // `initiate_remote_birth`, flow.rs:719) — the init template keeps only a
+    // placeholder the seal path never trusts before initiation (flow.rs:232 was
+    // the stand's copy, `O-5 A`: the issuer has no access to it).
+    let scan = fresh_scan_seed();
     let client = SideFile::new(Role::Client, &meta.id, &[], &map, &scan);
     client.write(&layout.client_side())?;
     let seeds: Seeds = serde_json::from_slice(
