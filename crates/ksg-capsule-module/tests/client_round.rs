@@ -11,9 +11,7 @@
 mod kit;
 
 use ksg_capsule_module::session::{Answer, Request, Session};
-use ksg_container_v2::client_key::{
-    KeygenReply, MobileHalf, MobileKeygen, SigningRound,
-};
+use ksg_container_v2::client_key::{KeygenReply, MobileHalf, MobileKeygen, SigningRound};
 
 /// A session born over the wire: the container initiated, the mobile half
 /// outside, the owner's signer still at hand.
@@ -30,8 +28,7 @@ fn begin(session: &mut Session, hello: &[u8]) -> Vec<u8> {
         hello: hello.to_vec(),
     }) {
         Answer::Done { bytes } => {
-            let v: serde_json::Value =
-                serde_json::from_slice(&bytes).expect("the reply is JSON");
+            let v: serde_json::Value = serde_json::from_slice(&bytes).expect("the reply is JSON");
             use base64::Engine as _;
             base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(v["reply"].as_str().expect("a reply field"))
@@ -43,12 +40,7 @@ fn begin(session: &mut Session, hello: &[u8]) -> Vec<u8> {
 
 /// One client round closed: the mobile half commits, the container answers
 /// the round, the mobile half shares, the share goes in.
-fn close_round(
-    session: &mut Session,
-    round_msg: &[u8],
-    half: &MobileHalf,
-    rng: &mut kit::TestRng,
-) {
+fn close_round(session: &mut Session, round_msg: &[u8], half: &MobileHalf, rng: &mut kit::TestRng) {
     let (nonces, commitment) = half.commit(rng);
     let round = match session.call(Request::ClientCommit {
         commitment: commitment.to_bytes().expect("the commitment encodes"),
@@ -64,7 +56,9 @@ fn close_round(
         }
         other => panic!("the commitment opens the round: {other:?}"),
     };
-    let share = half.respond(nonces, &round).expect("the mobile side answers");
+    let share = half
+        .respond(nonces, &round)
+        .expect("the mobile side answers");
     match session.call(Request::ClientShare {
         share: share.to_bytes(),
     }) {
@@ -84,7 +78,9 @@ fn wire_born() -> WireBorn {
     let (keygen, hello) = MobileKeygen::start(kit::client_kid(), &mut rng).expect("start");
     let reply = begin(&mut session, &hello.to_bytes().expect("the hello encodes"));
     let reply = KeygenReply::from_bytes(&reply).expect("the reply reads");
-    let (half, group, fin) = keygen.finish(&reply).expect("the mobile side keeps its half");
+    let (half, group, fin) = keygen
+        .finish(&reply)
+        .expect("the mobile side keeps its half");
     let fin = fin.to_bytes().expect("the finish encodes").to_vec();
     let round_msg = match session.call(Request::FinishBirth {
         fin: fin.clone(),
@@ -162,7 +158,10 @@ fn wire_born() -> WireBorn {
             }
             Answer::NeedsClientCommit { round } => {
                 n_rounds += 1;
-                assert!(n_rounds <= 6, "the press closes a few rounds, then moves: {last}");
+                assert!(
+                    n_rounds <= 6,
+                    "the press closes a few rounds, then moves: {last}"
+                );
                 close_round(&mut session, &round, &half, &mut rng);
                 cmd_label = String::from("sign_after_round");
                 cmd = Request::Sign {
@@ -184,11 +183,10 @@ fn wire_born() -> WireBorn {
                 let attestation = kit::attestation_for(&subject);
                 cmd_label = String::from("reanchor");
                 cmd = Request::Reanchor {
-                    attestation: serde_json::to_vec(&attestation)
-                        .expect("the attestation encodes"),
+                    attestation: serde_json::to_vec(&attestation).expect("the attestation encodes"),
                 };
             }
-            other => {
+            _other => {
                 cmd_label = String::from("refused-or-more");
                 cmd = Request::FinishBirth {
                     fin: fin.clone(),
@@ -222,11 +220,7 @@ fn pages_of(session: &mut Session) -> u64 {
 
 /// A `Work` driven to `Done` through the wire round, one round per message.
 /// Returns the round messages it signed and the closing `Done` payload.
-fn drive_opening(
-    session: &mut Session,
-    half: &MobileHalf,
-    rng: &mut kit::TestRng,
-) {
+fn drive_opening(session: &mut Session, half: &MobileHalf, rng: &mut kit::TestRng) {
     loop {
         match session.call(Request::OpenJournal) {
             Answer::Done { .. } => return,
@@ -252,10 +246,7 @@ fn drive_work(
                     serde_json::from_slice(&bytes).expect("the work answer is JSON");
                 for i in 0..msgs.len() {
                     for j in (i + 1)..msgs.len() {
-                        assert_ne!(
-                            msgs[i], msgs[j],
-                            "every round signs its own message"
-                        );
+                        assert_ne!(msgs[i], msgs[j], "every round signs its own message");
                     }
                 }
                 return (msgs, v);
@@ -352,7 +343,10 @@ fn a_second_commit_while_open_is_refused_and_the_round_survives() {
     // The open round survived the refusal: its share still closes it.
     let round = SigningRound::from_bytes(&round).expect("the round reads");
     assert_eq!(round.message(), round_msg.as_slice());
-    let share = wb.half.respond(nonces, &round).expect("the mobile side answers");
+    let share = wb
+        .half
+        .respond(nonces, &round)
+        .expect("the mobile side answers");
     match session.call(Request::ClientShare {
         share: share.to_bytes(),
     }) {
@@ -431,7 +425,10 @@ fn a_strangers_share_does_not_close_and_a_fresh_round_does() {
         Answer::NeedsClientCommit { round } => round,
         other => panic!("the work waits again: {other:?}"),
     };
-    assert_eq!(round_msg2, round_msg, "the same work asks for the same bytes");
+    assert_eq!(
+        round_msg2, round_msg,
+        "the same work asks for the same bytes"
+    );
     let (_, commitment_new) = wb.half.commit(&mut rng);
     let round_new = match session.call(Request::ClientCommit {
         commitment: commitment_new.to_bytes().expect("the commitment encodes"),
@@ -440,8 +437,7 @@ fn a_strangers_share_does_not_close_and_a_fresh_round_does() {
         other => panic!("the fresh commitment opens: {other:?}"),
     };
     assert_ne!(round_new, round_old, "fresh nonces, a fresh package");
-    let old_package =
-        SigningRound::from_bytes(&round_old).expect("the old round reads");
+    let old_package = SigningRound::from_bytes(&round_old).expect("the old round reads");
     let stranger = wb
         .half
         .respond(nonces_old, &old_package)
@@ -483,15 +479,17 @@ fn a_repeat_while_open_repeats_the_same_round() {
     match session.call(Request::Work {
         text: "same round".into(),
     }) {
-        Answer::NeedsShare { round: again } => assert_eq!(
-            again, round,
-            "the open round is answered again"
-        ),
+        Answer::NeedsShare { round: again } => {
+            assert_eq!(again, round, "the open round is answered again")
+        }
         other => panic!("the repeat answers the open round: {other:?}"),
     }
     let round = SigningRound::from_bytes(&round).expect("the round reads");
     assert_eq!(round.message(), round_msg.as_slice());
-    let share = wb.half.respond(nonces, &round).expect("the mobile side answers");
+    let share = wb
+        .half
+        .respond(nonces, &round)
+        .expect("the mobile side answers");
     match session.call(Request::ClientShare {
         share: share.to_bytes(),
     }) {
