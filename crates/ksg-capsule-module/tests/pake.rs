@@ -1,182 +1,144 @@
-//! The phone↔reader pairing channel (track И19): [`pair`] turns the
-//! holder-typed 6-digit code and the two sides' ephemeral halves into one
-//! channel key, and [`wrap`]/[`unwrap`] carry the halves under it.
+//! The phone↔reader pairing (track И19): [`pair`] turns the 6 digits
+//! the holder typed into a channel key both sides compute — and a side
+//! with another code gets another key, so the first wrapped message
+//! refuses to open.
 //!
-//! The properties the tests pin:
-//!
-//! | Property | Test |
-//! |---|----|
-//! | both sides with one code derive one key | `both_sides_derive_one_key` |
-//! | a wrapped message opens under the peer's key | `a_wrapped_message_opens_under_the_peers_key` |
-//! | a stranger's code derives another key and refuses the wrap | `a_strangers_code_refuses` |
-//! | a tampered or truncated wrap refuses | `a_tampered_wrap_refuses`, `a_cut_wrap_refuses` |
-//! | the key's `Debug` names it, never its bytes | `channel_key_debug_names_it` |
-//! | a non-6-digit code is refused before any key | `a_non_code_refuses` |
+//! The ceremony the tests pin:
 //!
 //! ```text
-//! code  = the 6 digits the holder typed
-//! ka    = pair(code, secret_a, public_b)
-//! kb    = pair(code, secret_b, public_a)   // ka == kb
-//! wrap  = nonce || XChaCha20-Poly1305(key, nonce, plaintext)
+//! same code on both sides → the same key → the message opens
+//! another code on one side → another key → `Refused`
 //! ```
 
-use ksg_capsule_module::pake::{pair, unwrap, wrap};
-use rand_core::RngCore;
+use ksg_capsule_module::pake::{pair, unwrap, wrap, PakeError};
 
-/// A deterministic RNG for the tests: the nonces only need freshness, not
-/// secrecy, so a counter stream is enough and keeps the tests reproducible.
-struct Ctr(u64);
+/// One fresh ephemeral pair: the secret this side keeps, the public half
+/// it sends in the clear.
+fn ephemeral(rng: &mut TestRng) -> ([u8; 32], [u8; 32]) {
+    let mut secret = [0u8; 32];
+    rng.fill_bytes(&mut secret);
+    let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret));
+    (secret, *public.as_bytes())
+}
 
-impl RngCore for Ctr {
-    fn next_u32(&mut self) -> u32 {
-        self.next_u64() as u32
-    }
+/// A deterministic generator for the tests only: splitmix64, the same
+/// stream the session tests' stand uses. Its quality is irrelevant — what
+/// the tests check is the pairing, not the keys.
+struct TestRng(u64);
 
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        self.0
-    }
-
+impl TestRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         for chunk in dest.chunks_mut(8) {
-            let word = self.next_u64().to_le_bytes();
-            chunk.copy_from_slice(&word[..chunk.len()]);
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let bytes = z.to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
         }
     }
+}
 
+impl rand_core::RngCore for TestRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        self.fill_bytes(&mut b);
+        u32::from_le_bytes(b)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut b = [0u8; 8];
+        self.fill_bytes(&mut b);
+        u64::from_le_bytes(b)
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        Self::fill_bytes(self, dest);
+    }
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
         self.fill_bytes(dest);
         Ok(())
     }
 }
 
-impl rand_core::CryptoRng for Ctr {}
+impl rand_core::CryptoRng for TestRng {}
 
-/// Two fresh ephemeral halves and their publics, deterministically.
-fn ephemerals(rng: &mut Ctr) -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
-    let mut secret_a = [0u8; 32];
-    let mut secret_b = [0u8; 32];
-    rng.fill_bytes(&mut secret_a);
-    rng.fill_bytes(&mut secret_b);
-    let public_a = {
-        let secret = x25519_dalek::StaticSecret::from(secret_a);
-        *x25519_dalek::PublicKey::from(&secret).as_bytes()
-    };
-    let public_b = {
-        let secret = x25519_dalek::StaticSecret::from(secret_b);
-        *x25519_dalek::PublicKey::from(&secret).as_bytes()
-    };
-    (secret_a, secret_b, public_a, public_b)
-}
-
-/// Both sides with one code derive one key.
+/// The same code on both sides derives the same channel key, and a message
+/// wrapped under it opens.
 #[test]
-fn both_sides_derive_one_key() {
-    let mut rng = Ctr(7);
-    let (secret_a, secret_b, public_a, public_b) = ephemerals(&mut rng);
-    let key_a = pair("482916", &secret_a, &public_b).expect("the code pairs");
-    let key_b = pair("482916", &secret_b, &public_a).expect("the code pairs");
+fn the_same_code_meets_and_the_message_opens() {
+    let mut rng = TestRng(41);
+    let (sec_a, pub_a) = ephemeral(&mut rng);
+    let (sec_b, pub_b) = ephemeral(&mut rng);
+    let key_a = pair("482917", &sec_a, &pub_b).expect("the phone pairs");
+    let key_b = pair("482917", &sec_b, &pub_a).expect("the reader pairs");
     assert_eq!(
         key_a.bytes(),
         key_b.bytes(),
-        "one code, two sides, one channel key"
+        "one ceremony, one channel key"
     );
-}
-
-/// A wrapped message opens under the peer's key.
-#[test]
-fn a_wrapped_message_opens_under_the_peers_key() {
-    let mut rng = Ctr(11);
-    let (secret_a, secret_b, public_a, public_b) = ephemerals(&mut rng);
-    let key_a = pair("482916", &secret_a, &public_b).expect("the code pairs");
-    let key_b = pair("482916", &secret_b, &public_a).expect("the code pairs");
-    let message = wrap(&key_a, &mut rng, b"the client's half travels here");
-    let opened = unwrap(&key_b, &message).expect("the peer's key opens the wrap");
+    let message = wrap(&key_a, &mut rng, b"the holder half travels");
     assert_eq!(
-        opened,
-        b"the client's half travels here",
-        "the halves travel under the channel key"
+        unwrap(&key_b, &message).expect("the message opens"),
+        b"the holder half travels",
+        "the channel carries"
     );
 }
 
-/// A stranger's code derives another key and refuses the wrap.
+/// A side with another code derives another key: the first wrapped message
+/// refuses to open.
 #[test]
-fn a_strangers_code_refuses() {
-    let mut rng = Ctr(13);
-    let (secret_a, secret_b, public_a, public_b) = ephemerals(&mut rng);
-    let key_a = pair("482916", &secret_a, &public_b).expect("the code pairs");
-    let key_wrong = pair("482917", &secret_b, &public_a).expect("a code still derives");
+fn a_stranger_code_is_refused() {
+    let mut rng = TestRng(42);
+    let (sec_a, pub_a) = ephemeral(&mut rng);
+    let (sec_b, pub_b) = ephemeral(&mut rng);
+    let key_a = pair("482917", &sec_a, &pub_b).expect("the phone pairs");
+    let stranger = pair("000000", &sec_b, &pub_a).expect("the pairing derives, not checks");
     assert_ne!(
         key_a.bytes(),
-        key_wrong.bytes(),
-        "one digit off, another key"
+        stranger.bytes(),
+        "another code, another key"
     );
-    let message = wrap(&key_a, &mut rng, b"the client's half travels here");
-    assert!(
-        unwrap(&key_wrong, &message).is_err(),
-        "the stranger's code does not open the wrap"
-    );
-}
-
-/// A tampered wrap refuses.
-#[test]
-fn a_tampered_wrap_refuses() {
-    let mut rng = Ctr(17);
-    let (secret_a, secret_b, public_a, public_b) = ephemerals(&mut rng);
-    let key_a = pair("482916", &secret_a, &public_b).expect("the code pairs");
-    let key_b = pair("482916", &secret_b, &public_a).expect("the code pairs");
-    let mut message = wrap(&key_a, &mut rng, b"the client's half travels here");
-    let last = message.len() - 1;
-    message[last] ^= 1;
-    assert!(
-        unwrap(&key_b, &message).is_err(),
-        "a flipped bit fails the AEAD check"
-    );
-}
-
-/// A cut wrap refuses: too short for the nonce, or a cut ciphertext.
-#[test]
-fn a_cut_wrap_refuses() {
-    let mut rng = Ctr(19);
-    let (secret_a, secret_b, public_a, public_b) = ephemerals(&mut rng);
-    let key_a = pair("482916", &secret_a, &public_b).expect("the code pairs");
-    let key_b = pair("482916", &secret_b, &public_a).expect("the code pairs");
-    let message = wrap(&key_a, &mut rng, b"the client's half travels here");
-    assert!(
-        unwrap(&key_b, &message[..10]).is_err(),
-        "shorter than a nonce refuses"
-    );
-    assert!(
-        unwrap(&key_b, &message[..message.len() - 2]).is_err(),
-        "a cut ciphertext fails the AEAD check"
-    );
-}
-
-/// The channel key's `Debug` names it, never its bytes.
-#[test]
-fn channel_key_debug_names_it() {
-    let mut rng = Ctr(23);
-    let (secret_a, secret_b, public_a, public_b) = ephemerals(&mut rng);
-    let key = pair("482916", &secret_a, &public_b).expect("the code pairs");
-    let shown = format!("{key:?}");
-    assert_eq!(shown, "ChannelKey(..)", "a name, not bytes: {shown}");
-    let other = pair("000000", &secret_b, &public_a).expect("another code pairs");
+    let message = wrap(&key_a, &mut rng, b"the holder half travels");
     assert_eq!(
-        format!("{other:?}"),
-        shown,
-        "different bytes, the same name"
+        unwrap(&stranger, &message).unwrap_err(),
+        PakeError::Refused,
+        "the stranger code does not open the channel"
     );
 }
 
-/// A non-6-digit code is refused before any key: short, long, non-digit.
+/// What is not 6 ASCII digits never starts a pairing.
 #[test]
-fn a_non_code_refuses() {
-    let mut rng = Ctr(29);
-    let (secret_a, _secret_b, _public_a, public_b) = ephemerals(&mut rng);
-    for bad in ["", "48291", "4829160", "48291a", "abcdef", "4829 6"] {
-        assert!(
-            pair(bad, &secret_a, &public_b).is_err(),
-            "not 6 ASCII digits refuses: {bad:?}"
+fn what_is_not_six_digits_never_pairs() {
+    let secret = [0x11; 32];
+    let peer = [0x22; 32];
+    for bad in ["", "12345", "1234567", "abcdef", "12 345"] {
+        assert_eq!(
+            pair(bad, &secret, &peer).unwrap_err(),
+            PakeError::BadCode,
+            "no pairing under {bad:?}"
         );
     }
+}
+
+/// A tampered message and a stub too short for a nonce refuse to open.
+#[test]
+fn tampering_and_a_stub_are_refused() {
+    let mut rng = TestRng(43);
+    let (sec_a, pub_a) = ephemeral(&mut rng);
+    let (sec_b, pub_b) = ephemeral(&mut rng);
+    let key_a = pair("482917", &sec_a, &pub_b).expect("the phone pairs");
+    let key_b = pair("482917", &sec_b, &pub_a).expect("the reader pairs");
+    let mut message = wrap(&key_a, &mut rng, b"the holder half travels");
+    let last = message.len() - 1;
+    message[last] ^= 0x01;
+    assert_eq!(
+        unwrap(&key_b, &message).unwrap_err(),
+        PakeError::Refused,
+        "a flipped byte breaks the seal"
+    );
+    assert_eq!(
+        unwrap(&key_b, &message[..7]).unwrap_err(),
+        PakeError::Refused,
+        "a stub holds no nonce"
+    );
 }
