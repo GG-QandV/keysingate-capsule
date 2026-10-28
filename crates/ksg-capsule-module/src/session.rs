@@ -639,7 +639,7 @@ impl Session {
     /// | [`Request::Keys`] | the keys a verifier checks the pages with, as a JSON array |
     /// | [`Request::Work`] | `{"pages": n, "seal": "<multihash>"}` |
     /// | [`Request::ExportPage`] | the page as JSON, as `ksg-verify-v2` reads it — the same bytes the session keeps in its outputs |
-    /// | [`Request::Initiate`] | `{"container": "<multihash>", "mobile_half": "<base64url>", "share_commitment": "<base64url>"}` (stand-only) |
+    /// | [`Request::Initiate`] | `{"container": "<multihash>", "share_commitment": "<base64url>"}` (stand-only; the mobile half never leaves the module) |
     /// | [`Request::BeginBirth`] | `{"reply": "<base64url>"}` (message 2 for the mobile side) |
     /// | [`Request::FinishBirth`] | `{"container": "<multihash>"}` |
     /// | [`Request::OpenJournal`] | `{"pages": n, "seal": "<multihash>"}` |
@@ -667,9 +667,10 @@ impl Session {
     /// Closes the session: the new capsule and what the reader must keep
     /// outside it.
     ///
-    /// `outputs` are, in order: the client's mobile half after an initiation
-    /// (the reader writes it into the side file — without it the client could
-    /// never sign again), and every page an export handed out.
+    /// `outputs` are, in order, every page an export handed out. The client's
+    /// mobile half is never an output: it stays inside the module (stand-only
+    /// birth) or never enters it (the split birth of И1), and the reader never
+    /// needs to read it back.
     ///
     /// # Errors
     ///
@@ -1150,9 +1151,10 @@ impl Session {
         }
     }
 
-    /// The bookkeeping of a pressed birth: the client's half goes to the
-    /// reader, and the session forgets it when the owner's file is the one
-    /// that pressed (the half is the client's).
+    /// The bookkeeping of a pressed birth: the half never leaves the
+    /// module — it stays in the session, or the session forgets it at once
+    /// when the owner's file is the one that pressed (the half is the
+    /// client's, not the reader's to keep).
     fn birth_done(&mut self, id: Hash) -> Answer {
         let Some(mobile) = self.mobile.take() else {
             return Answer::Refused {
@@ -1168,18 +1170,10 @@ impl Session {
             }
         };
         // E-19: the commitment to the mobile half — the reader anchors it.
+        // The half itself is no output: it never leaves the module.
         let commitment = share_commitment(&share);
-        let half = match mobile.to_bytes() {
-            Ok(b) => b,
-            Err(e) => {
-                return Answer::Refused {
-                    reason: format!("the half does not encode: {e}"),
-                };
-            }
-        };
         self.pending_birth = false;
         self.pending_owner = None;
-        self.outputs.push(half.to_vec());
         if self.owner.is_some() {
             // The owner pressed the initiation: the client's half is the
             // client's, and this session forgets it at once.
@@ -1190,7 +1184,6 @@ impl Session {
         Answer::Done {
             bytes: serde_json::json!({
                 "container": id.to_multihash(),
-                "mobile_half": B64.encode(half.as_slice()),
                 "share_commitment": B64.encode(commitment),
             })
             .to_string()

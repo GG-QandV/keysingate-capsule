@@ -86,8 +86,16 @@ fn k5_offline_a_printed_capsule_verifies_page_by_page() {
 
     let initiated = flow::initiate(&layout).expect("the initiation goes through");
     assert!(
-        initiated.get("mobile_half").and_then(serde_json::Value::as_str).is_some(),
-        "the client's half is handed to the reader: {initiated}"
+        initiated
+            .get("mobile_half")
+            .and_then(serde_json::Value::as_str)
+            .is_none(),
+        "no half leaves the module: the initiation hands out no mobile_half: {initiated}"
+    );
+    let file = SideFile::read(&layout.client_side()).expect("the client's file");
+    assert!(
+        !file.half.is_empty(),
+        "the client's half is written to the client's file"
     );
     assert_capsule_size(&layout, "after initiate");
 

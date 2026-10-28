@@ -15,10 +15,14 @@ use base64::Engine as _;
 use ksg_capsule_module::session::{AnchorKind, Answer, Request};
 use ksg_cli_v2::home::{kid, owner_seed, Seeds};
 use ksg_cli_v2::InitOptions;
+use ksg_container_v2::client_key::{
+    KeygenReply, MobileHalf, MobileKeygen, SigningRound,
+};
 use ksg_core_v2::crypto::hash::Hash;
 use ksg_core_v2::crypto::sign::Ed25519Signer;
 use ksg_core_v2::doc::{Class, Uri};
 use ksg_verify_v2::solana::{HttpRpc, SealScanKey};
+use rand_core::OsRng;
 use zeroize::Zeroizing;
 
 use crate::session::Session;
@@ -333,6 +337,13 @@ fn open(layout: &Layout, party: Party) -> Result<Session, String> {
 }
 
 /// The bytes a `Done` answer carries, or the answer's refusal in words.
+///
+/// The only answers that arrive here are `Done` (the work is pressed),
+/// `Refused` (nothing is, and the reason says why) and `NeedsAnchor` (a seal
+/// or a status record owes the network: the caller answers it first). A
+/// signature round — the client's or the owner's — is closed inside the
+/// caller (`round_client`, `owner_signature`): `initiate` and `work` hand
+/// their `Needs*` answers there and only `done` what pressed.
 fn done(answer: Answer) -> Result<Vec<u8>, String> {
     match answer {
         Answer::Done { bytes } => Ok(bytes),
@@ -341,9 +352,27 @@ fn done(answer: Answer) -> Result<Vec<u8>, String> {
         Answer::NeedsSignature { party, .. } => {
             Err(format!("the {party}'s signature is needed"))
         }
+        Answer::NeedsClientCommit { .. } | Answer::NeedsShare { .. } => {
+            Err("the client's round is open: answer it before closing the command".into())
+        }
     }
 }
 
+/// One round of the client's split key through the wire (И4): the stand holds
+/// the mobile half and signs with it in this process — as the phone will over
+/// its own channel.
+///
+/// `msg` is the exact bytes the module asked to sign (a `NeedsClientCommit`
+/// carries them); the commitment goes back in through `Request::ClientCommit`,
+/// the round comes out as `NeedsShare`, and the returned share goes in through
+/// `Request::ClientShare`. Returns what the share closed with: `Done` means
+/// the round is closed and the command waits for a repeat, `Refused` means the
+/// round dropped and the command may open a fresh one.
+///
+/// # Errors
+///
+/// The commitment does not encode, the round does not open or does not sign
+/// what was asked for, or the mobile half answers nothing.
 /// Closes a session and writes the capsule back atomically.
 fn finish(layout: &Layout, session: Session) -> Result<Vec<Vec<u8>>, String> {
     let (capsule, outputs) = session.close()?;
@@ -376,14 +405,21 @@ fn owner_signature(layout: &Layout, bytes: &[u8]) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&signature).map_err(|e| format!("signature: {e}"))
 }
 
-/// E-4 through the capsule: the client's key is born, the owner signs the
-/// bytes the module asks for (the signature is made **outside** the module by
-/// the owner's file), the half goes into the client's side file.
+/// E-4 through the capsule, in the stand: the client's key is born with the
+/// mobile half held here, the owner signs what the module asks for (the
+/// signature is made **outside** the module by the owner's file), and the
+/// half goes into the client's side file.
+///
+/// The birth crosses the same wire the product will use: `BeginBirth` takes
+/// the mobile side's hello out of this process, `FinishBirth` takes the
+/// container's share back to it, and every client signature after that spans
+/// the `NeedsClientCommit`/`ClientShare` round — answered by `round_client`
+/// with the half held here — until `Done`.
 ///
 /// # Errors
 ///
 /// The capsule is initiated already, the owner's file is missing or is not the
-/// owner's, the module refuses.
+/// owner's, the mobile side refuses the container's answer, the module refuses.
 pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
     let raw = Zeroizing::new(
         std::fs::read(layout.client_side())
@@ -392,37 +428,48 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
     let capsule = std::fs::read(layout.capsule())
         .map_err(|e| format!("{}: {e}", layout.capsule().display()))?;
     let mut session = Session::open(&capsule, &raw, Vec::new())?;
-    let first = session.call(&Request::Initiate)?;
-    let answer = anchor_and_reanchor(layout, &mut session, first, Party::Client)?;
-    let answer = match answer {
-        Answer::NeedsSignature { bytes, .. } => {
-            let wire = owner_signature(layout, &bytes)?;
-            let signed = session.call(&Request::Sign { signature: wire })?;
-            anchor_and_reanchor(layout, &mut session, signed, Party::Client)?
-        }
-        other => other,
+    let unborn = Uri::parse(kid::UNBORN).map_err(|e| format!("unborn kid: {e}"))?;
+    let (keygen, hello) = MobileKeygen::start(unborn, &mut OsRng)
+        .map_err(|e| format!("the mobile side starts no birth: {e}"))?;
+    let hello = hello
+        .to_bytes()
+        .map_err(|e| format!("the birth hello does not encode: {e}"))?;
+    let reply = match session.call(&Request::BeginBirth { hello })? {
+        Answer::Done { bytes } => bytes,
+        Answer::Refused { reason } => return Err(format!("refused: {reason}")),
+        other => return Err(format!("the birth answers no hello: {other:?}")),
     };
-    let bytes = done(answer)?;
+    let reply: serde_json::Value =
+        serde_json::from_slice(&reply).map_err(|e| format!("the birth reply: {e}"))?;
+    let reply = reply
+        .get("reply")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("the birth reply names no reply")?;
+    let reply = KeygenReply::from_bytes(
+        &B64.decode(reply)
+            .map_err(|_| "the birth reply is not base64url".to_string())?,
+    )
+    .map_err(|e| format!("the birth reply does not read: {e}"))?;
+    let (half, group, fin) = keygen
+        .finish(&reply)
+        .map_err(|e| format!("the mobile side keeps no half: {e}"))?;
+    let fin = fin
+        .to_bytes()
+        .map_err(|e| format!("the birth finish does not encode: {e}"))?
+        .to_vec();
+    let first = Request::FinishBirth {
+        fin,
+        group_key: group,
+    };
+    let bytes = done(drive_until_done(layout, &mut session, &half, &first, 40)?)?;
     let mut value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("the initiation: {e}"))?;
     // The journal opens in the same session (E-5, page 0): the capsule's
     // commands are `work` from here, as on the stand after `open-journal`.
     // In Pro page 0 carries the owner's co-seal (CH-26): a client's session
     // answers `NeedsSignature`, the reader signs outside the module.
-    let first = session.call(&Request::OpenJournal)?;
-    let opening = match anchor_and_reanchor(layout, &mut session, first, Party::Client)? {
-        Answer::NeedsSignature { bytes, .. } => {
-            let wire = owner_signature(layout, &bytes)?;
-            let signed = session.call(&Request::Sign { signature: wire })?;
-            done(anchor_and_reanchor(
-                layout,
-                &mut session,
-                signed,
-                Party::Client,
-            )?)?
-        }
-        other => done(other)?,
-    };
+    let opening = Request::OpenJournal;
+    let opening = done(drive_until_done(layout, &mut session, &half, &opening, 40)?)?;
     let opening: serde_json::Value =
         serde_json::from_slice(&opening).map_err(|e| format!("the opening: {e}"))?;
     if let Some(map) = value.as_object_mut() {
@@ -430,38 +477,166 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
     }
     finish(layout, session)?;
 
-    // The half is the client's: it goes into the client's file, or the client
-    // could never sign again.
-    if let Some(half) = value.get("mobile_half").and_then(serde_json::Value::as_str) {
-        let mut file = SideFile::read(&layout.client_side())?;
-        file.half = half.to_string();
-        file.write(&layout.client_side())?;
-    }
+    // The half is the client's: the mobile side kept it, and the reader held
+    // it through the birth — the client's file, or the client could never
+    // sign again.
+    let mut file = SideFile::read(&layout.client_side())?;
+    file.half = B64.encode(
+        half.to_bytes()
+            .map_err(|e| format!("the mobile half does not encode: {e}"))?
+            .as_slice(),
+    );
+    file.write(&layout.client_side())?;
     Ok(value)
 }
 
+/// The mobile half the client's file keeps since the initiation.
+///
+/// # Errors
+///
+/// The client's file does not read, carries no half (a capsule sealed before
+/// initiation), or bytes that are not one.
+fn client_half(layout: &Layout) -> Result<MobileHalf, String> {
+    let file = SideFile::read(&layout.client_side())?;
+    let raw = B64
+        .decode(&file.half)
+        .map_err(|_| "client.side: the half is not base64url".to_string())?;
+    MobileHalf::from_bytes(&raw).map_err(|e| format!("client.side: half: {e}"))
+}
+
 /// E-5: one step of the agent's work becomes a page.
+///
+/// The client's signature spans the wire round: the command repeats until it
+/// presses, every `NeedsClientCommit` turning with the half the client's file
+/// keeps since the initiation.
 ///
 /// # Errors
 ///
 /// Not initiated, refused, or the capsule does not write.
 pub fn work(layout: &Layout, text: &str) -> Result<serde_json::Value, String> {
     let mut session = open(layout, Party::Client)?;
-    let first = session.call(&Request::Work { text: text.into() })?;
-    let answer = anchor_and_reanchor(layout, &mut session, first, Party::Client)?;
-    let bytes = done(answer)?;
+    let half = client_half(layout)?;
+    let cmd = Request::Work { text: text.into() };
+    let bytes = done(drive_until_done(layout, &mut session, &half, &cmd, 40)?)?;
     finish(layout, session)?;
     serde_json::from_slice(&bytes).map_err(|e| format!("the page's receipt: {e}"))
 }
 
+/// Repeats `cmd` until it presses: anchors go out through
+/// `anchor_and_reanchor`, every client round turns with the half the stand
+/// holds (`round_client`), and the owner's co-seal goes back in through
+/// `owner_signature` — until `Done`, or the refusal the press ends with.
+///
+/// A `Done` (or a drop) that only closes a client round repeats `cmd`: the
+/// round's signatures wait for it inside the module. A `Done` or `Refused`
+/// over `cmd` itself — or over the owner's `Sign` — is the press's answer.
+///
+/// `budget` bounds the turns: an answer that never presses is a livelock, not
+/// a press.
+///
+/// # Errors
+///
+/// A round the half refuses, an anchor the network refuses, a round that
+/// breaks off mid-way, or a press still open after `budget` turns.
+fn drive_until_done(
+    layout: &Layout,
+    session: &mut Session,
+    half: &MobileHalf,
+    cmd: &Request,
+    budget: u32,
+) -> Result<Answer, String> {
+    let mut req = cmd.clone();
+    for _ in 0..budget {
+        let raw = session.call(&req)?;
+        let answer = anchor_and_reanchor(layout, session, raw, Party::Client)?;
+        match answer {
+            Answer::Done { .. } | Answer::Refused { .. } => {
+                if matches!(req, Request::ClientShare { .. }) {
+                    // The round closed (or dropped): the command repeats and
+                    // opens a fresh round over the same bytes.
+                    req = cmd.clone();
+                    continue;
+                }
+                return Ok(answer);
+            }
+            Answer::NeedsClientCommit { ref round } => {
+                let closed = round_client(session, half, round)?;
+                match closed {
+                    Answer::Done { .. } => {
+                        req = cmd.clone();
+                        continue;
+                    }
+                    Answer::Refused { reason } => {
+                        // The round dropped: the command repeats and opens a
+                        // fresh one over the same bytes.
+                        let _ = reason;
+                        req = cmd.clone();
+                        continue;
+                    }
+                    other => return Err(format!("the share closes no round: {other:?}")),
+                }
+            }
+            Answer::NeedsSignature { bytes, .. } => {
+                let wire = owner_signature(layout, &bytes)?;
+                req = Request::Sign { signature: wire };
+            }
+            Answer::NeedsShare { .. } | Answer::NeedsAnchor { .. } => {
+                return Err(format!("the press broke off mid-round: {answer:?}"))
+            }
+        }
+    }
+    Err("the press never closed: the client round does not converge".into())
+}
+
+fn round_client(
+    session: &mut Session,
+    half: &MobileHalf,
+    msg: &[u8],
+) -> Result<Answer, String> {
+    let (nonces, commitment) = half.commit(&mut OsRng);
+    let commitment = commitment
+        .to_bytes()
+        .map_err(|e| format!("the commitment does not encode: {e}"))?;
+    let round = match session.call(&Request::ClientCommit { commitment })? {
+        Answer::NeedsShare { round } => {
+            SigningRound::from_bytes(&round).map_err(|e| format!("the round does not read: {e}"))?
+        }
+        other => {
+            return Err(format!(
+                "the commitment opens no round: {other:?}"
+            ))
+        }
+    };
+    if round.message() != msg {
+        return Err("the round signs other bytes than asked for".into());
+    }
+    let share = half
+        .respond(nonces, &round)
+        .map_err(|e| format!("the mobile half answers nothing: {e}"))?;
+    session.call(&Request::ClientShare {
+        share: share.to_bytes(),
+    })
+}
+
 /// A pointwise export of one page, sealed by `party`.
+///
+/// A client's export spans the wire round like `work`: `round_client`
+/// answers every `NeedsClientCommit` with the half the client's file keeps,
+/// and the command repeats until `Done`. An owner's export seals at once.
 ///
 /// # Errors
 ///
 /// Not initiated, refused, or the capsule does not write.
 pub fn export_page(layout: &Layout, number: u64, party: Party) -> Result<Vec<u8>, String> {
     let mut session = open(layout, party)?;
-    let bytes = done(session.call(&Request::ExportPage { number })?)?;
+    let bytes = match party {
+        Party::Client => {
+            let half = client_half(layout)?;
+            let cmd = Request::ExportPage { number };
+            done(drive_until_done(layout, &mut session, &half, &cmd, 40)?)?
+        }
+        Party::Owner => done(session.call(&Request::ExportPage { number })?)?,
+    };
     let outputs = finish(layout, session)?;
     let page = outputs
         .into_iter()
