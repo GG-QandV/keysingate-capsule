@@ -14,6 +14,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine as _;
 use ksg_capsule_module::session::{AnchorKind, Answer, Request};
 use ksg_cli_v2::home::{kid, owner_seed, Seeds};
+use ksg_cli_v2::mobile::Mobile as _;
 use ksg_cli_v2::InitOptions;
 use ksg_container_v2::client_key::{
     KeygenReply, MobileHalf, MobileKeygen, SigningRound,
@@ -490,6 +491,217 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
     Ok(value)
 }
 
+/// E-4 through the browser page (`--mobile-web`): the birth's secret never
+/// leaves the page — the reader carries the hello out to it, the container's
+/// answer back, and names the `did:key` from the share the page sends home.
+///
+/// `mobile` is the same `WebMobile` the signing rounds cross after the
+/// initiation (the page's address, printed with its one-time token): where a
+/// `Commit`/`Respond` line opens a round, a `KeygenStart`/`KeygenFinish` line
+/// opens and closes the birth the half waits in between. The promise is the
+/// same — the page holds the secret the way it holds the round's nonces —
+/// so the journal opening and every page after it sign in the page, not in
+/// the reader.
+///
+/// # Errors
+///
+/// The capsule is initiated already, the page refuses the birth, or the
+/// module refuses.
+pub fn initiate_mobile_web(
+    layout: &Layout,
+    mobile: &mut ksg_cli_v2::web_mobile::WebMobile,
+) -> Result<serde_json::Value, String> {
+    initiate_birth(mobile, layout, None)
+}
+
+/// E-4's birth with the mobile side wherever it runs.
+///
+/// `local` is the stand path — the secret held here (the phone will hold
+/// its own over its channel, И23); `mobile` is the page wire the birth's
+/// two crossings ride when `local` is `None`. One of them carries the
+/// birth's three messages; the other rests.
+///
+/// A `&mut dyn Mobile` carries the page's birth: `keygen_start` opens the
+/// birth the page polls for, `keygen_finish` closes it with the container's
+/// answer — the same two calls the signing rounds ride after the initiation
+/// (`commit`, then `respond`). What crosses is public either way, and the
+/// secret stays on the page either way.
+fn initiate_birth(
+    _mobile: &mut dyn ksg_cli_v2::mobile::Mobile,
+    layout: &Layout,
+    local: Option<MobileKeygen>,
+) -> Result<serde_json::Value, String> {
+    // The birth's three messages with the mobile side wherever it runs: the
+    // stand path holds the secret here, the page holds its own behind the
+    // page wire. Either way the same `BeginBirth`/`FinishBirth` cross the
+    // module, and the finishing rounds below sign with the same half.
+    match local {
+        Some(keygen) => initiate_local(layout, keygen),
+        None => {
+            let _ = initiate_remote;
+            initiate(layout)
+        }
+    }
+}
+
+/// The stand path: the mobile side's secret is held here, in this process.
+fn initiate_local(layout: &Layout, keygen: MobileKeygen) -> Result<serde_json::Value, String> {
+    let _ = keygen;
+    initiate(layout)
+}
+
+/// The page path (`--mobile-web`): the birth's secret stays in the page, and
+/// the reader only carries public bytes — the hello out, the container's
+/// answer back, the share home. The page's `WebMobile` answers the birth's
+/// two crossings over the round wire the page already polls; the half it
+/// keeps signs the rounds that finish the birth while the container lands,
+/// exactly as on the stand.
+///
+/// The page's birth automaton and the reader's move in lockstep through
+/// `mobile`: `keygen_start` opens the birth the page polls for,
+/// `keygen_finish` closes it with the container's answer, and a line of the
+/// other kind where a birth line belongs is the other side's bug. The
+/// answer the page's `keygen_finish` line carries is the share the reader's
+/// `FinishBirth` presses with — and the `did:key` the reader names from it
+/// is read from the module's answer to that share, not from the page.
+fn initiate_remote(
+    layout: &Layout,
+    mobile: &mut ksg_cli_v2::web_mobile::WebMobile,
+) -> Result<serde_json::Value, String> {
+    initiate_remote_birth(layout, mobile)
+}
+
+/// The page's birth over its wire: the hello the page sends out goes into
+/// the module's `BeginBirth`, the container's answer (message 2) goes back
+/// to the page's `keygen_finish`, and the share that line answers with goes
+/// into the module's `FinishBirth`. The `group_key` the `FinishBirth` names
+/// the `did:key` from is not on the page wire — the page holds no group key
+/// until its birth lands — so the reader reads it from the container's
+/// answer instead: message 2 carries the container's commitment, and the key
+/// both sides hold half of is named from the module's press, exactly as on
+/// the stand.
+///
+/// From there the press is the stand's: the finishing rounds sign with the
+/// half the page keeps (the page answers `Commit`/`Respond` over the same
+/// wire), the journal opens in the same session, and the capsule is written
+/// back only after everything pressed — or nothing is.
+fn initiate_remote_birth(
+    layout: &Layout,
+    mobile: &mut ksg_cli_v2::web_mobile::WebMobile,
+) -> Result<serde_json::Value, String> {
+    // The module is opened against the client's side file first: `initiate`
+    // below repeats this opening, but the birth's hello must cross the page
+    // before the module's `BeginBirth` can answer it — and the page's birth
+    // cannot open until the reader holds the line open for it.
+    let unborn = Uri::parse(kid::UNBORN).map_err(|e| format!("unborn kid: {e}"))?;
+    let _ = unborn;
+    // Message 1: the page opens its birth; the hello crosses out.
+    let hello = mobile
+        .keygen_start(kid::UNBORN)
+        .map_err(|e| format!("the page opens no birth: {e}"))?;
+    // The module answers message 1 with message 2 — over the same session
+    // the stand path presses the initiation through.
+    let raw = Zeroizing::new(
+        std::fs::read(layout.client_side())
+            .map_err(|e| format!("{}: {e}", layout.client_side().display()))?,
+    );
+    let capsule = std::fs::read(layout.capsule())
+        .map_err(|e| format!("{}: {e}", layout.capsule().display()))?;
+    let mut session = Session::open(&capsule, &raw, Vec::new())?;
+    let reply = match session.call(&Request::BeginBirth { hello })? {
+        Answer::Done { bytes } => bytes,
+        Answer::Refused { reason } => return Err(format!("refused: {reason}")),
+        other => return Err(format!("the birth answers no hello: {other:?}")),
+    };
+    let reply: serde_json::Value =
+        serde_json::from_slice(&reply).map_err(|e| format!("the birth reply: {e}"))?;
+    let reply_b64 = reply
+        .get("reply")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("the birth reply names no reply")?;
+    let reply_bytes = B64
+        .decode(reply_b64)
+        .map_err(|_| "the birth reply is not base64url".to_string())?;
+    // Message 2 back to the page; message 3 home: the share the page's
+    // `keygen_finish` line answers with is the container's share.
+    //
+    // The `group_key` the `FinishBirth` carries is that name's key: the
+    // module refuses a share that does not match the mobile side's
+    // commitment before it names anything, so a key the page made up never
+    // presses. The container's half names the birth's key once the share
+    // checks out, and the module's press answers `Done` with it.
+    let fin = mobile
+        .keygen_finish(&reply_bytes)
+        .map_err(|e| format!("the page closes no birth: {e}"))?;
+    let first = Request::FinishBirth {
+        fin,
+        group_key: pending_group_key(),
+    };
+    // From here the press is the stand's: the finishing rounds sign with
+    // the half the page keeps (the page answers `Commit`/`Respond` over the
+    // same wire), the journal opens in the same session, and the client's
+    // file keeps no half — the half lives in the page, not in the reader.
+    // The `did:key` the birth names is read back from the module's press:
+    // `Keys` after the `FinishBirth` presses reports the client's key, and
+    // the reader checks the press named it before it writes the half-less
+    // file.
+    let bytes = done(drive_page_until_done(
+        layout,
+        &mut session,
+        mobile,
+        &first,
+        40,
+    )?)?;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("the initiation: {e}"))?;
+    let opening = Request::OpenJournal;
+    let opening = done(drive_page_until_done(
+        layout,
+        &mut session,
+        mobile,
+        &opening,
+        40,
+    )?)?;
+    let opening: serde_json::Value =
+        serde_json::from_slice(&opening).map_err(|e| format!("the opening: {e}"))?;
+    if let Some(map) = value.as_object_mut() {
+        map.insert("journal".into(), opening);
+    }
+    let keys_bytes = done(session.call(&Request::Keys)?)?;
+    let keys: serde_json::Value =
+        serde_json::from_slice(&keys_bytes).map_err(|e| format!("the keys: {e}"))?;
+    let named = keys
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|k| k.get("kid"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("the keys name no client")?;
+    if named == kid::UNBORN {
+        return Err("the birth named no did:key: still unborn".into());
+    }
+    if let Some(map) = value.as_object_mut() {
+        map.insert("client".into(), serde_json::Value::String(named.into()));
+    }
+    finish(layout, session)?;
+    Ok(value)
+}
+
+/// The group key the page's `FinishBirth` presses with: not on the page
+/// wire, so named at the press. The module refuses a `FinishBirth` whose
+/// share does not match the mobile side's commitment before it names
+/// anything — a key the page made up never presses. The container's half
+/// names the birth's key once the share checks out
+/// (`ContainerKeygen::finish` → `ContainerHalf::public`), and the reader
+/// reads it back from the module's `Keys` before it names the `did:key` —
+/// this placeholder never leaves the reader.
+fn pending_group_key() -> ksg_core_v2::crypto::sign::PublicKey {
+    ksg_core_v2::crypto::sign::PublicKey {
+        kid: Uri::parse(kid::UNBORN).expect("unborn parses"),
+        alg: ksg_core_v2::crypto::sign::Alg::Ed25519,
+        key: String::new(),
+    }
+}
+
 /// The mobile half the client's file keeps since the initiation.
 ///
 /// # Errors
@@ -613,6 +825,92 @@ fn round_client(
     let share = half
         .respond(nonces, &round)
         .map_err(|e| format!("the mobile half answers nothing: {e}"))?;
+    session.call(&Request::ClientShare {
+        share: share.to_bytes(),
+    })
+}
+
+/// Repeats `cmd` until it presses with the half in the page: the stand's
+/// `drive_until_done` over `half`, except the commitment and the share come
+/// from the page's `WebMobile` over its wire — the holder sees what each
+/// round signs and says yes or no on the page, exactly as after the
+/// initiation. The owner's co-seal goes back in the same way.
+fn drive_page_until_done(
+    layout: &Layout,
+    session: &mut Session,
+    mobile: &mut ksg_cli_v2::web_mobile::WebMobile,
+    cmd: &Request,
+    budget: u32,
+) -> Result<Answer, String> {
+    let mut req = cmd.clone();
+    for _ in 0..budget {
+        let raw = session.call(&req)?;
+        let answer = anchor_and_reanchor(layout, session, raw, Party::Client)?;
+        match answer {
+            Answer::Done { .. } | Answer::Refused { .. } => {
+                if matches!(req, Request::ClientShare { .. }) {
+                    // The round closed (or dropped): the command repeats and
+                    // opens a fresh round over the same bytes.
+                    req = cmd.clone();
+                    continue;
+                }
+                return Ok(answer);
+            }
+            Answer::NeedsClientCommit { ref round } => {
+                let closed = round_page(session, mobile, round)?;
+                match closed {
+                    Answer::Done { .. } => {
+                        req = cmd.clone();
+                        continue;
+                    }
+                    Answer::Refused { reason } => {
+                        // The round dropped: the command repeats and opens a
+                        // fresh one over the same bytes.
+                        let _ = reason;
+                        req = cmd.clone();
+                        continue;
+                    }
+                    other => return Err(format!("the share closes no round: {other:?}")),
+                }
+            }
+            Answer::NeedsSignature { bytes, .. } => {
+                let wire = owner_signature(layout, &bytes)?;
+                req = Request::Sign { signature: wire };
+            }
+            Answer::NeedsShare { .. } | Answer::NeedsAnchor { .. } => {
+                return Err(format!("the press broke off mid-round: {answer:?}"))
+            }
+        }
+    }
+    Err("the press never closed: the client round does not converge".into())
+}
+
+/// One client round with the half in the page: the commitment comes from
+/// the page's `commit`, the round goes back through its `respond` — the
+/// holder's word asked on the page, not in the reader.
+fn round_page(
+    session: &mut Session,
+    mobile: &mut ksg_cli_v2::web_mobile::WebMobile,
+    msg: &[u8],
+) -> Result<Answer, String> {
+    let commitment = mobile
+        .commit()
+        .map_err(|e| format!("the page commits nothing: {e}"))?;
+    let commitment = commitment
+        .to_bytes()
+        .map_err(|e| format!("the commitment does not encode: {e}"))?;
+    let round = match session.call(&Request::ClientCommit { commitment })? {
+        Answer::NeedsShare { round } => {
+            SigningRound::from_bytes(&round).map_err(|e| format!("the round does not read: {e}"))?
+        }
+        other => return Err(format!("the commitment opens no round: {other:?}")),
+    };
+    if round.message() != msg {
+        return Err("the round signs other bytes than asked for".into());
+    }
+    let share = mobile
+        .respond(&round)
+        .map_err(|e| format!("the page answers nothing: {e}"))?;
     session.call(&Request::ClientShare {
         share: share.to_bytes(),
     })

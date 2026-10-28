@@ -5,7 +5,7 @@
 //!                              [--serial N] [--artifact URI] [--anchor solana:CLUSTER
 //!                              (--payer KEYFILE | --service URL --holder ID) [--rpc URL]]
 //!                              [--wasm PATH]
-//! ksg-capsule --home DIR initiate
+//! ksg-capsule --home DIR initiate [--mobile-web ADDR] [--web-root DIR]
 //! ksg-capsule --home DIR work TEXT
 //! ksg-capsule --home DIR export-page N [--by client|owner] [--out FILE]
 //! ksg-capsule --home DIR keys [--out FILE]
@@ -27,7 +27,7 @@ ksg-capsule --home DIR init [--class light|heavy|bare] [--emission ksg:em:test:N
                              [--serial N] [--artifact URI] [--anchor solana:CLUSTER
                              (--payer KEYFILE | --service URL --holder ID) [--rpc URL]]
                              [--wasm PATH]
-ksg-capsule --home DIR initiate
+ksg-capsule --home DIR initiate [--mobile-web ADDR] [--web-root DIR]
 ksg-capsule --home DIR work TEXT
 ksg-capsule --home DIR export-page N [--by client|owner] [--out FILE]
 ksg-capsule --home DIR keys [--out FILE]
@@ -130,7 +130,11 @@ fn run(args: &[String]) -> Result<(), Problem> {
             Ok(())
         }
         "initiate" => {
-            let value = flow::initiate(&layout)?;
+            let web = mobile_web(&args)?;
+            let value = match web {
+                None => flow::initiate(&layout)?,
+                Some(mut web) => flow::initiate_mobile_web(&layout, &mut web)?,
+            };
             println!("{value}");
             Ok(())
         }
@@ -250,4 +254,25 @@ fn parse_print(args: &Args) -> Result<Print, Problem> {
         }
     };
     Ok(print)
+}
+
+/// The browser page as the mobile half for `initiate`: the half is born in
+/// the page (`ksg-web-v2`), and the reader only carries public bytes — the
+/// hello out, the container's answer back, the share in `FinishBirth` — the
+/// same wire the phone's `Keygen` automaton crosses. `None` without
+/// `--mobile-web`; `--web-root DIR` serves the page's files.
+fn mobile_web(args: &Args) -> Result<Option<Box<ksg_cli_v2::web_mobile::WebMobile>>, Problem> {
+    match (args.get("mobile-web"), args.get("web-root")) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(usage("--web-root goes with --mobile-web")),
+        (Some(addr), root) => {
+            let web = ksg_cli_v2::web_mobile::WebMobile::listen(
+                addr,
+                root.map(std::path::PathBuf::from),
+            )
+            .map_err(Problem::Failed)?;
+            eprintln!("mobile half: open {}", web.url);
+            Ok(Some(Box::new(web)))
+        }
+    }
 }
