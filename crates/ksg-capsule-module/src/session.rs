@@ -87,7 +87,7 @@ use ksg_core_v2::section::StatusRecord;
 use ksg_core_v2::status::{transition_for, Outcome};
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, Zeroizing};
+use crate::secret::{OwnerKey, StateKey};
 
 /// The anchor kind of a record this module presses offline. No network
 /// accepts it (`ksg-verify-v2` says so by name); the reader's anchor replaces
@@ -416,8 +416,9 @@ pub struct Session {
     /// Every map the capsule seals to, in slot order; re-assembly re-seals
     /// each slot to its own public halves.
     maps: Vec<(MapRole, SealTo)>,
-    /// The key the container's state is sealed under.
-    state_key: Zeroizing<[u8; 32]>,
+    /// The key the container's state is sealed under: wiped when the
+    /// session drops ([`StateKey`]).
+    state_key: StateKey,
     /// The container's template identifier — what the state opens as.
     template: Hash,
     /// The artefact the initiation is bound to.
@@ -437,8 +438,9 @@ pub struct Session {
     /// The client's half, while the session holds it: from the side file, or
     /// just born by [`Request::Initiate`].
     mobile: Option<MobileHalf>,
-    /// The owner's key, when the side file is the owner's.
-    owner: Option<Ed25519Signer>,
+    /// The owner's key, when the side file is the owner's: wiped when
+    /// the session drops ([`OwnerKey`]).
+    owner: Option<OwnerKey>,
     /// A birth done in memory and not yet pressed: the client's key exists,
     /// the initiation does not. A close with one pending refuses — the birth
     /// is never stored (`Container::begin_birth`), so dropping it would lose
@@ -595,7 +597,7 @@ impl Session {
         let mut session = Self {
             container,
             maps,
-            state_key: Zeroizing::new(state_key),
+            state_key: StateKey::new(state_key),
             template,
             artifact,
             client_kid,
@@ -720,7 +722,7 @@ impl Session {
         let mut rng = CspRng;
         let state = self
             .container
-            .seal_to_bytes(&self.state_key, &mut rng)
+            .seal_to_bytes(self.state_key.bytes(), &mut rng)
             .map_err(|e| format!("the state does not seal: {e}"))?;
         let mut fill = |out: &mut [u8]| rng.fill_bytes(out);
         let capsule = seal_parts(
@@ -1683,7 +1685,7 @@ impl Session {
             }
         }
         match &self.owner {
-            Some(signer) => Ok(signer.sign(msg)),
+            Some(key) => Ok(key.signer().sign(msg)),
             None => Err(self.missing(Party::Owner, msg)),
         }
     }
@@ -2005,7 +2007,7 @@ struct ClientRound {
 #[allow(clippy::too_many_arguments)]
 fn seal_parts(
     state: &[u8],
-    state_key: &[u8; 32],
+    state_key: &StateKey,
     template: Hash,
     artifact: &str,
     client: &str,
@@ -2018,7 +2020,7 @@ fn seal_parts(
 ) -> Result<Vec<u8>, String> {
     capsule::seal_into_capsule(
         state,
-        state_key,
+        state_key.bytes(),
         &template.to_multihash(),
         artifact,
         client,
@@ -2034,9 +2036,10 @@ fn seal_parts(
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // The halves wipe themselves; the state key goes here, in one place a
-        // reader can point at.
-        self.state_key.zeroize();
+        // The halves wipe themselves; the state key and the owner key wipe
+        // through their own `Drop` — in one place a reader can point at.
+        // No manual loop over memory here: a copy the loop did not see
+        // would live on, while `ZeroizeOnDrop` covers the fields.
     }
 }
 
@@ -2103,7 +2106,7 @@ const fn side_role_name(role: SideRole) -> &'static str {
 /// The key's identifier is not in the file: the container's roster pins it, so
 /// the roster is where it comes from — and a seed that yields another key than
 /// the pinned one is refused rather than used.
-fn open_owner(container: &Container, half: &str) -> Result<Ed25519Signer, String> {
+fn open_owner(container: &Container, half: &str) -> Result<OwnerKey, String> {
     let pinned = container
         .roster()
         .holder(Role::Owner)
@@ -2114,7 +2117,7 @@ fn open_owner(container: &Container, half: &str) -> Result<Ed25519Signer, String
     if signer.public() != pinned {
         return Err("side file: the half is not the owner's key the roster pinned".into());
     }
-    Ok(signer)
+    Ok(OwnerKey::from_seed(signer, seed))
 }
 
 /// A map rebuilt from its public halves, for re-sealing its slot.
