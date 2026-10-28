@@ -183,6 +183,18 @@ impl Fixture {
     /// A heavy (Pro) container, initiated, with page 0 written: page 0
     /// carries the owner's seal and a placeholder anchor (CH-26), the status
     /// records their placeholder anchors.
+    /// A template container for the birth automaton (CH-5b): printed, the
+    /// packet and the buyer's key pressed, initiation NOT pressed. The key
+    /// is not born yet: `mobile` is a placeholder of nobody's, and
+    /// [`Fixture::side_file_empty`] carries no half.
+    #[must_use]
+    pub fn unborn() -> Self {
+        let mut f = Self::printed_unborn(Class::Light, Parties::new(), TestRng(7));
+        f.press_packet();
+        f.press_buyer_key();
+        f
+    }
+
     #[must_use]
     pub fn started_heavy() -> Self {
         let mut f = Self::printed(Class::Heavy, Parties::new(), TestRng(7));
@@ -258,6 +270,68 @@ impl Fixture {
             .integrate_client_key(inside)
             .expect("the container's half");
 
+        Self {
+            container,
+            mobile,
+            map_seed: [7; 32],
+            state_key: [9; 32],
+            template,
+            issued_ms: 0,
+            clock_ms: 50_000,
+            parties,
+            rng,
+        }
+    }
+
+    /// As [`Fixture::printed`], but the issuer prints a template (CH-5b):
+    /// no client's key, no identifier of its own — both are born at
+    /// initiation through `begin_birth` / `finish_birth`. The `mobile`
+    /// placeholder signs nothing until the birth gives it a half.
+    fn printed_unborn(class: Class, parties: Parties, rng: TestRng) -> Self {
+        let mut rng = rng;
+        let (_, mobile) = split(client_kid(), &mut rng).expect("a placeholder half");
+        let template = section_root(EMISSION, SERIAL);
+        let issued_at = ts("2026-09-01T00:00:00.000Z");
+        let id = template;
+        let mut r0 = StatusRecord {
+            context: ksg_core_v2::doc::Context,
+            doc_type: "StatusRecord".into(),
+            v: 3,
+            number: 0,
+            status: Status::Printed,
+            event: None,
+            offset_ms: 0,
+            prev: template,
+            signatures: SignatureSet::default(),
+        };
+        r0.signatures = SignatureSet::new(vec![
+            sign_doc(&r0, &parties.issuer).expect("the issuer's word")
+        ]);
+        let a0 = anchor(r0.hash().expect("record 0 hashes"));
+        let issuer_keys: KeySet = [parties.issuer.public()].into_iter().collect();
+        let section =
+            StatusSection::start(EMISSION, SERIAL, r0, a0, &issuer_keys, &Profile::default())
+                .expect("the section starts");
+        let roster = Roster::of([
+            (parties.issuer.public(), Role::Issuer),
+            (parties.owner.public(), Role::Owner),
+            (parties.buyer.public(), Role::Buyer),
+        ]);
+        let release = Release {
+            id: EMISSION.into(),
+            issued_at,
+            class,
+        };
+        let pq = ksg_container_v2::pq_key::ContainerPqKey::generate(
+            uri("did:key:zContainer#pq"),
+            &mut rng,
+        )
+        .expect("the container's post-quantum key");
+        let container =
+            Container::print(release, SERIAL, MemoFormat::Controlled, section, roster)
+                .with_pq_key(pq);
+        assert_eq!(id, container.template_id(), "a template has no identifier of its own");
+        assert!(!container.born(), "nothing born before initiation");
         Self {
             container,
             mobile,
@@ -463,6 +537,22 @@ impl Fixture {
             "role": "client",
             "container": self.container.id().to_multihash(),
             "half": B64.encode(half.as_slice()),
+            "map": B64.encode(self.map_seed),
+            "scan": B64.encode([3u8; 32]),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// The client's side file before initiation: the key is not born, so
+    /// the file carries no half. The container it names is the template.
+    #[must_use]
+    pub fn side_file_empty(&self) -> Vec<u8> {
+        serde_json::json!({
+            "v": 1,
+            "role": "client",
+            "container": self.container.template_id().to_multihash(),
+            "half": "",
             "map": B64.encode(self.map_seed),
             "scan": B64.encode([3u8; 32]),
         })

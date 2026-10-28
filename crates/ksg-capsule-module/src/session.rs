@@ -78,7 +78,7 @@ use ksg_container_v2::{Event, Operation, Role, Where, Work, Wrapped};
 use ksg_core_v2::anchor::Attestation;
 use ksg_core_v2::canonical::canonical_bytes;
 use ksg_core_v2::crypto::hash::Hash;
-use ksg_core_v2::crypto::sign::{Ed25519Signer, Profile, Signature, SignatureSet};
+use ksg_core_v2::crypto::sign::{Ed25519Signer, Profile, PublicKey, Signature, SignatureSet};
 use ksg_core_v2::doc::{Timestamp, Uri};
 use ksg_core_v2::journal::{Draft, Piece, RecordKind, RecordMeta, Sealing};
 use ksg_core_v2::section::StatusRecord;
@@ -103,7 +103,29 @@ pub const LOCAL_ANCHOR: &str = "urn:ksg:anchor:local:v1";
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Request {
     /// E-4: the client's key is born; the maps' public halves come with it.
+    ///
+    /// Stand-only path: both halves are born inside the module (demo). The
+    /// product splits the birth: `BeginBirth` / `FinishBirth`.
     Initiate,
+    /// E-4 split, messages 1-2: the mobile side commitment comes in, the
+    /// container answer (message 2) goes out. Nothing is pressed yet.
+    BeginBirth {
+        /// `KeygenHello` bytes, base64url.
+        #[serde(with = "b64")]
+        hello: Vec<u8>,
+    },
+    /// E-4 split, message 3: the mobile side kept its half and sends the
+    /// container share; the module presses the initiation. The mobile half
+    /// never enters the module.
+    FinishBirth {
+        /// `KeygenFinish` bytes, base64url.
+        #[serde(with = "b64")]
+        fin: Vec<u8>,
+        /// The client public key as the mobile side computed it
+        /// (`MobileKeygen::finish` output before naming): the module names
+        /// the `did:key` from its material and refuses on mismatch.
+        group_key: PublicKey,
+    },
     /// E-5: one step of the agent's work becomes a page.
     Work {
         /// What was done, as the agent recorded it — the page's content.
@@ -553,7 +575,9 @@ impl Session {
     /// | [`Request::Keys`] | the keys a verifier checks the pages with, as a JSON array |
     /// | [`Request::Work`] | `{"pages": n, "seal": "<multihash>"}` |
     /// | [`Request::ExportPage`] | the page as JSON, as `ksg-verify-v2` reads it — the same bytes the session keeps in its outputs |
-    /// | [`Request::Initiate`] | `{"container": "<multihash>", "mobile_half": "<base64url>", "share_commitment": "<base64url>"}` |
+    /// | [`Request::Initiate`] | `{"container": "<multihash>", "mobile_half": "<base64url>", "share_commitment": "<base64url>"}` (stand-only) |
+    /// | [`Request::BeginBirth`] | `{"reply": "<base64url>"}` (message 2 for the mobile side) |
+    /// | [`Request::FinishBirth`] | `{"container": "<multihash>"}` |
     /// | [`Request::OpenJournal`] | `{"pages": n, "seal": "<multihash>"}` |
     /// | [`Request::Reanchor`] | the last owed anchor settled: `{"pages", "seal"}`, as the opening's |
     /// | [`Request::Sign`] | the same as the command whose signature was missing |
@@ -566,6 +590,8 @@ impl Session {
             Request::Work { text } => self.work(&text),
             Request::ExportPage { number } => self.export_page(number),
             Request::Initiate => self.initiate(),
+            Request::BeginBirth { hello } => self.begin_birth_request(&hello),
+            Request::FinishBirth { fin, group_key } => self.finish_birth_request(&fin, group_key),
             Request::Reanchor { attestation } => self.reanchor(&attestation),
             Request::OpenJournal => self.open_journal(),
             Request::Sign { signature } => self.sign_pending(&signature),
@@ -879,6 +905,154 @@ impl Session {
         }
     }
 
+    /// E-4 split, messages 1-2: the mobile side started outside
+    /// (`MobileKeygen::start`) and sent its commitment (`KeygenHello`); the
+    /// container answers with message 2 (`KeygenReply`). Nothing is pressed:
+    /// the birth is the container keygen waiting for message 3.
+    ///
+    /// A second call while message 3 is still missing re-answers with a fresh
+    /// message 2 — the mobile side restarts from it.
+    fn begin_birth_request(&mut self, hello_bytes: &[u8]) -> Answer {
+        if self.container.born() {
+            return Answer::Refused {
+                reason: "the container is initiated already".into(),
+            };
+        }
+        use ksg_container_v2::client_key::KeygenHello;
+        let hello = match KeygenHello::from_bytes(hello_bytes) {
+            Ok(h) => h,
+            Err(e) => {
+                return Answer::Refused {
+                    reason: format!("the birth hello does not read: {e}"),
+                }
+            }
+        };
+        let mut rng = CspRng;
+        let reply = match self
+            .container
+            .begin_birth(self.client_kid.clone(), &hello, &mut rng)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Answer::Refused {
+                    reason: format!("the container does not answer the birth: {e}"),
+                }
+            }
+        };
+        match reply.to_bytes() {
+            Ok(bytes) => Answer::Done {
+                bytes: serde_json::json!({ "reply": B64.encode(bytes.as_slice()) })
+                    .to_string()
+                    .into_bytes(),
+            },
+            Err(e) => {
+                self.container.cancel_birth();
+                Answer::Refused {
+                    reason: format!("the birth reply does not encode: {e}"),
+                }
+            }
+        }
+    }
+
+    /// E-4 split, message 3: the mobile side checked message 2, kept its half
+    /// and sends the container share (`KeygenFinish`) with the group key it
+    /// computed. The module names the `did:key` from that key material,
+    /// finishes the container birth, and presses the initiation — the mobile
+    /// half never enters the module.
+    fn finish_birth_request(&mut self, fin_bytes: &[u8], group_key: PublicKey) -> Answer {
+        if self.container.born() {
+            return Answer::Refused {
+                reason: "the container is initiated already".into(),
+            };
+        }
+        use ksg_container_v2::client_key::KeygenFinish;
+        let fin = match KeygenFinish::from_bytes(fin_bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                return Answer::Refused {
+                    reason: format!("the birth finish does not read: {e}"),
+                }
+            }
+        };
+        // The group key exists only once both rounds are done; the mobile side
+        // computed it outside. The client identifier is its `did:key` — the
+        // same name the stand path derives — so name the birth before the
+        // container keeps its half.
+        let named = match ksg_core_v2::crypto::did_key::kid(&group_key) {
+            Ok(k) => k,
+            Err(e) => {
+                return Answer::Refused {
+                    reason: format!("the group key names no did:key: {e}"),
+                }
+            }
+        };
+        if let Err(e) = self.container.name_birth(named.clone()) {
+            self.container.cancel_birth();
+            return Answer::Refused {
+                reason: format!("the container does not take the name: {e}"),
+            };
+        }
+        let offset_ms = self.tick();
+        let (born, id) = match self
+            .container
+            .finish_birth(&fin, self.artifact.clone(), offset_ms)
+        {
+            Ok(x) => x,
+            Err(e) => {
+                self.container.cancel_birth();
+                return Answer::Refused {
+                    reason: format!("the container keeps no half: {e}"),
+                };
+            }
+        };
+        if born.key != group_key.key || born.alg != group_key.alg {
+            self.container.cancel_birth();
+            return Answer::Refused {
+                reason: "the two sides of the birth hold halves of different keys".into(),
+            };
+        }
+        self.client_kid = named;
+        self.pending_birth = true;
+        // No mobile half inside: the client signs through the round of И4, so
+        // a `NeedsSignature { party: client }` here is the bridge, not an error.
+        let pressed = self.press(
+            Operation::Initiate,
+            &[Party::Client, Party::Owner],
+            &Evidence::Initiation { at: Where::Inside },
+            PageToWrite::None,
+        );
+        match pressed {
+            Ok(()) => self.finish_birth_done(id),
+            Err(needs @ Answer::NeedsSignature { .. }) => {
+                self.pending_bytes = match &needs {
+                    Answer::NeedsSignature { bytes, .. } => bytes.clone(),
+                    _ => Vec::new(),
+                };
+                needs
+            }
+            Err(owed @ Answer::NeedsAnchor { .. }) => owed,
+            Err(refused) => {
+                self.container.cancel_birth();
+                self.pending_birth = false;
+                refused
+            }
+        }
+    }
+
+    /// The bookkeeping of a pressed split birth: no half to hand out — the
+    /// mobile side kept its own — only the container identifier goes out.
+    /// The birth queue clears; the client round of И4 answers the pending
+    /// signature, the network answers the pending anchor.
+    fn finish_birth_done(&mut self, id: Hash) -> Answer {
+        self.pending_birth = false;
+        self.pending_owner = None;
+        Answer::Done {
+            bytes: serde_json::json!({ "container": id.to_multihash() })
+                .to_string()
+                .into_bytes(),
+        }
+    }
+
     /// The bookkeeping of a pressed birth: the client's half goes to the
     /// reader, and the session forgets it when the owner's file is the one
     /// that pressed (the half is the client's).
@@ -1099,7 +1273,11 @@ impl Session {
         match pressed {
             Ok(()) => {
                 let id = *self.container.id();
-                self.birth_done(id)
+                if self.mobile.is_some() {
+                    self.birth_done(id)
+                } else {
+                    self.finish_birth_done(id)
+                }
             }
             Err(Answer::NeedsSignature { bytes, .. }) => {
                 self.pending_bytes = bytes;
@@ -1179,7 +1357,10 @@ impl Session {
                 }
                 if self.pending_birth {
                     let id = *self.container.id();
-                    return self.birth_done(id);
+                    if self.mobile.is_some() {
+                        return self.birth_done(id);
+                    }
+                    return self.finish_birth_done(id);
                 }
                 Answer::Done {
                     bytes: serde_json::json!({
