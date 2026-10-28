@@ -1180,7 +1180,12 @@ impl Session {
         }
     }
 
-    /// E-5: the journal opens — page 0, sealed by the client's two halves.
+    /// E-5: the journal is open — page 0, sealed by the client's two halves.
+    ///
+    /// With no half inside (И4г) the seal goes through the wire round: the
+    /// reader answers each `NeedsClientCommit`/`NeedsShare` in turn and
+    /// repeats `OpenJournal` until `Done` (or the owner's `NeedsSignature`
+    /// in Pro).
     ///
     /// Pro opens with the owner's seal and the anchor (CH-26), as on the
     /// stand: a client's session answers [`Answer::NeedsSignature`] with the
@@ -1852,7 +1857,11 @@ impl Session {
         let bytes = canonical_bytes(&record).map_err(|e| Answer::Refused {
             reason: format!("the status record does not encode: {e}"),
         })?;
-        record.signatures = if self.mobile.is_some() {
+        // The client's session signs through its halves — over the wire
+        // when the half is outside (И4г: no half inside, the status move
+        // answers `NeedsClientCommit` like `Work`); the owner's session
+        // with its key, as before.
+        record.signatures = if self.mobile.is_some() || self.owner.is_none() {
             SignatureSet::new(self.sign_client(&bytes)?)
         } else {
             SignatureSet::new(vec![self.sign_owner(&bytes)?])
