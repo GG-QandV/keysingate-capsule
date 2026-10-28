@@ -71,7 +71,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine as _;
 use ksg_container_v2::capsule::{self, MapPub, MapRole, Part, PartKind, Shared};
-use ksg_container_v2::client_key::{share_commitment, MobileHalf};
+use ksg_container_v2::client_key::{
+    share_commitment, Commitment, MobileHalf, MobileShare, SigningRound,
+};
 use ksg_container_v2::container::{Container, Evidence, JournalWrite, Writes};
 use ksg_container_v2::layers::{OpenWith, SealTo, MLKEM_EK_LEN};
 use ksg_container_v2::{Event, Operation, Role, Where, Work, Wrapped};
@@ -450,6 +452,19 @@ pub struct Session {
     /// The owner's co-seal over [`Session::pending_open_bytes`], handed in
     /// by [`Request::Sign`] while an opening waits for it.
     pending_open_owner: Option<Signature>,
+    /// What crosses the wire while a client round is open: the message
+    /// both halves sign, and the mobile side's commitment it started from.
+    /// Kept until the round closes — a `ClientCommit` while one is open is
+    /// refused, just as a `ClientShare` with none open is.
+    client_round: Option<ClientRound>,
+    /// The message a command wants the wire round to sign: set by
+    /// [`Session::sign_client`] when it answers `NeedsClientCommit`, read by
+    /// [`Session::client_commit`], cleared when the round opens. A
+    /// commitment names no message — it answers this one.
+    client_round_msg: Option<Vec<u8>>,
+    /// The wire round's signatures, waiting for the command to be repeated:
+    /// the message they sign, and the signatures themselves.
+    pending_client_sigs: Option<(Vec<u8>, Vec<Signature>)>,
     /// The anchors the network still owes this session, oldest first — a
     /// seal before its status record. A press in Pro queues them and answers
     /// the head; each [`Request::Reanchor`] takes the head off and answers
@@ -577,6 +592,9 @@ impl Session {
             pending_open_bytes: Vec::new(),
             pending_open_offset: None,
             pending_open_owner: None,
+            client_round: None,
+            client_round_msg: None,
+            pending_client_sigs: None,
             pending_anchors: std::collections::VecDeque::new(),
         };
         for (i, raw) in anchored.iter().enumerate() {
@@ -619,9 +637,8 @@ impl Session {
             Request::Reanchor { attestation } => self.reanchor(&attestation),
             Request::OpenJournal => self.open_journal(),
             Request::Sign { signature } => self.sign_pending(&signature),
-            Request::ClientCommit { .. } | Request::ClientShare { .. } => Answer::Refused {
-                reason: "no client round open".into(),
-            },
+            Request::ClientCommit { commitment } => self.client_commit(&commitment),
+            Request::ClientShare { share } => self.client_share(&share),
         }
     }
 
@@ -992,6 +1009,28 @@ impl Session {
                 reason: "the container is initiated already".into(),
             };
         }
+        if self.pending_birth {
+            // The press waits for a party: the signature round answers it, a
+            // repeated FinishBirth re-asks the same bytes — the birth is not
+            // pressed twice.
+            return match self.press(
+                Operation::Initiate,
+                &[Party::Client, Party::Owner],
+                &Evidence::Initiation { at: Where::Inside },
+                PageToWrite::None,
+            ) {
+                // The press went in through the wire round: the birth is
+                // pressed, only the queue waits.
+                Ok(()) => {
+                    let id = *self.container.id();
+                    self.finish_birth_done(id)
+                }
+                // Any other answer — `NeedsClientCommit`, `NeedsShare`, a
+                // stranger's refusal, the network's `NeedsAnchor` — goes back
+                // to the reader as it is.
+                Err(answer) => answer,
+            };
+        }
         use ksg_container_v2::client_key::KeygenFinish;
         let fin = match KeygenFinish::from_bytes(fin_bytes) {
             Ok(f) => f,
@@ -1040,8 +1079,11 @@ impl Session {
         }
         self.client_kid = named;
         self.pending_birth = true;
-        // No mobile half inside: the client signs through the round of И4, so
-        // a `NeedsSignature { party: client }` here is the bridge, not an error.
+        // No mobile half inside: the client signs through the round of И4 —
+        // the wire answers `NeedsClientCommit`, the reader's commitment goes
+        // in through `Request::ClientCommit`, the round through
+        // `Answer::NeedsShare` and `Request::ClientShare`. An owner's
+        // signature (`NeedsSignature { party: owner }`) is the other wait.
         let pressed = self.press(
             Operation::Initiate,
             &[Party::Client, Party::Owner],
@@ -1050,6 +1092,9 @@ impl Session {
         );
         match pressed {
             Ok(()) => self.finish_birth_done(id),
+            // The client round carries no party: only the owner names one.
+            Err(needed @ Answer::NeedsClientCommit { .. })
+            | Err(needed @ Answer::NeedsShare { .. }) => needed,
             Err(needs @ Answer::NeedsSignature { .. }) => {
                 self.pending_bytes = match &needs {
                     Answer::NeedsSignature { bytes, .. } => bytes.clone(),
@@ -1424,7 +1469,39 @@ impl Session {
     /// The client signs through both halves: the mobile one here, the
     /// container's inside. The round is opened and closed in one call — the
     /// capsule model keeps both halves in one process for the demo (Л-10).
+    ///
+    /// With no half inside ([`Session::finish_birth_request`], И4в), the
+    /// round spans the wire instead: [`Answer::NeedsClientCommit`] carries
+    /// the message both halves sign, [`Request::ClientCommit`] opens the
+    /// container's side of it, [`Answer::NeedsShare`] carries the round the
+    /// mobile side signs, and [`Request::ClientShare`] closes it. A session
+    /// that already holds the half signs at once, as before.
     fn sign_client(&mut self, msg: &[u8]) -> Result<Vec<Signature>, Answer> {
+        // The wire round's signatures wait for the repeated command: the
+        // same message picks them up, another message drops them — they
+        // sign exactly what the round signed.
+        if let Some((waiting, sigs)) = self.pending_client_sigs.take() {
+            if waiting == msg {
+                return Ok(sigs);
+            }
+        }
+        if self.mobile.is_some() {
+            return self.sign_client_local(msg);
+        }
+        // No half inside: the signature comes over the wire. A round already
+        // open is answered again — the same message, so the same round.
+        if let Some(open) = &self.client_round {
+            return Err(self.needs_share(&open.round));
+        }
+        self.client_round_msg = Some(msg.to_vec());
+        Err(Answer::NeedsClientCommit {
+            round: msg.to_vec(),
+        })
+    }
+
+    /// The client's half is here: one call opens the round, answers it, and
+    /// closes it — as on the stand.
+    fn sign_client_local(&mut self, msg: &[u8]) -> Result<Vec<Signature>, Answer> {
         let Some(mobile) = &self.mobile else {
             return Err(self.missing(Party::Client, msg));
         };
@@ -1453,7 +1530,107 @@ impl Session {
             })
     }
 
-    /// The owner signs with its own key — or, while a command waits for the
+    /// "Sign this round": the round bytes the mobile side signs — the
+    /// container's package over the waiting message.
+    fn needs_share(&self, round: &SigningRound) -> Answer {
+        let bytes = match round.to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                return Answer::Refused {
+                    reason: format!("the round does not encode: {e}"),
+                }
+            }
+        };
+        Answer::NeedsShare { round: bytes }
+    }
+
+    /// The message the wire round signs, if a command opened one: the reader
+    /// commits to it first. `None` when no command waits for a commitment.
+    fn client_round_msg(&mut self) -> Option<Vec<u8>> {
+        self.client_round_msg.clone()
+    }
+
+    /// The mobile side's commitment comes in: the container opens its side
+    /// of the round over the message [`Answer::NeedsClientCommit`] carried.
+    /// The answer carries the round the mobile side signs.
+    ///
+    /// A commitment with a round already open — or with no message waiting
+    /// for one — is refused: one round at a time, and only for a command
+    /// that asked.
+    fn client_commit(&mut self, raw: &[u8]) -> Answer {
+        let Some(open) = self.client_round_msg() else {
+            return Answer::Refused {
+                reason: "no client round waits for a commitment".into(),
+            };
+        };
+        if self.client_round.is_some() {
+            return Answer::Refused {
+                reason: "a client round is already open: answer it with a share".into(),
+            };
+        }
+        let commitment = match Commitment::from_bytes(raw) {
+            Ok(c) => c,
+            Err(e) => {
+                return Answer::Refused {
+                    reason: format!("the commitment does not read: {e}"),
+                }
+            }
+        };
+        let mut rng = CspRng;
+        let round = match self.container.begin_signing(&open, &commitment, &mut rng) {
+            Ok(r) => r,
+            Err(e) => {
+                self.client_round = None;
+                return Answer::Refused {
+                    reason: format!("the container opens no round: {e}"),
+                };
+            }
+        };
+        self.client_round_msg = None;
+        let answer = self.needs_share(&round);
+        self.client_round = Some(ClientRound {
+            msg: open,
+            commitment,
+            round,
+        });
+        answer
+    }
+
+    /// The mobile side's share comes in: the container adds its own and
+    /// closes the round, and the signatures wait for the command to be
+    /// repeated — the reader repeats it, and [`Session::sign_client`] picks
+    /// them up. A stranger's share does not verify and the round drops.
+    fn client_share(&mut self, raw: &[u8]) -> Answer {
+        let Some(open) = self.client_round.take() else {
+            return Answer::Refused {
+                reason: "no client round open".into(),
+            };
+        };
+        let share = match MobileShare::from_bytes(raw) {
+            Ok(s) => s,
+            Err(e) => {
+                return Answer::Refused {
+                    reason: format!("the share does not read: {e}"),
+                }
+            }
+        };
+        let mut rng = CspRng;
+        match self.container.finish_signing(&share, &mut rng) {
+            Ok(sigs) => {
+                let len = open.msg.len();
+                self.pending_client_sigs = Some((open.msg, sigs));
+                Answer::Done {
+                    bytes: serde_json::to_vec(&serde_json::json!({
+                        "accepted": len,
+                    }))
+                    .unwrap_or_default(),
+                }
+            }
+            Err(e) => Answer::Refused {
+                reason: format!("the round does not close: {e}"),
+            },
+        }
+    }
     /// other party, with the signature the reader handed in
     /// ([`Request::Sign`]) over exactly the bytes it was asked for.
     fn sign_owner(&self, msg: &[u8]) -> Result<Signature, Answer> {
@@ -1690,6 +1867,22 @@ impl Session {
         self.clock_ms = elapsed.max(self.clock_ms.saturating_add(1));
         self.clock_ms
     }
+}
+
+/// A client signature round waiting for the mobile side.
+///
+/// The message is what both halves sign; the commitment is the mobile side's
+/// half of the round the container opened. `ClientShare` checks the share
+/// against both, then the round is dropped — nonces are used once.
+#[derive(Debug)]
+struct ClientRound {
+    /// What both halves sign.
+    msg: Vec<u8>,
+    /// The mobile side's commitment the container opened the round with.
+    #[allow(dead_code)]
+    commitment: Commitment,
+    /// The container's answer: the package the mobile side signs.
+    round: SigningRound,
 }
 
 /// A session's close: the shared secrets part, the code, the state, the parts
