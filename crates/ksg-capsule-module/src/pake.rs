@@ -1,4 +1,4 @@
-//! The phone↔reader channel: PAKE by a 6-digit code, then AEAD (И19).
+//! The phone↔reader channel: SPAKE2 PAKE by a 6-digit code, then AEAD (И19).
 //!
 //! The birth of the client's key is split across two devices — the phone
 //! holds one half, the capsule's reader the other. Before the halves may
@@ -10,26 +10,37 @@
 //!
 //! # Protocol
 //!
-//! Both sides pick an ephemeral X25519 key, exchange the public halves in
-//! the clear, and stretch the transcript into the channel key with HKDF:
+//! Both sides run SPAKE2 in symmetric mode ([`spake2`], RustCrypto, Ed25519
+//! group) with the 6-digit code as the password and `ksg-pake-v1` as the
+//! identity, exchange the 33-byte messages, and stretch the SPAKE2 output
+//! into the channel key with HKDF:
 //!
 //! ```text
 //! code  = the 6 digits the holder typed (21 bits of entropy)
-//! salt  = SHA-256("ksg-pake-v1" || code || side_a_ephemeral || side_b_ephemeral)
-//! ikm   = code || x25519(ephemeral_secret, peer_ephemeral)
-//! key   = HKDF-SHA256(ikm, salt, "ksg-pake-channel-v1")
+//! raw   = SPAKE2-symmetric(code, identity "ksg-pake-v1", msg_a, msg_b)
+//! key   = HKDF-SHA256(raw, info "ksg-pake-channel-v1")
+//! proof = HMAC-SHA256(key, ordered(msg_a, msg_b))
 //! ```
 //!
-//! The code enters twice: it salts the transcript hash *and* prefixes the
-//! key material. A listener that replays the ephemerals but guesses the
-//! code wrong derives another key, and the AEAD check on the first wrapped
-//! message refuses it. The 6-digit code has ~21 bits of entropy — enough
-//! against one online guess per pairing ceremony, not against an offline
-//! dictionary: the ephemerals MUST be fresh per ceremony, and a side MUST
-//! stop after a handful of failed opens (the caller enforces both; this
-//! module only derives and wraps).
+//! SPAKE2 is a password-authenticated key exchange: a passive listener
+//! learns nothing about the code or the key, and an active
+//! person-in-the-middle gets exactly one guess at the code per ceremony —
+//! a wrong guess derives an unrelated key, and, crucially, the transcript
+//! alone never lets them check further guesses offline. The 10^6-code
+//! dictionary cannot be replayed against a recording: each ceremony's
+//! messages are fresh, and only the live peer's confirmation decides.
 //!
-//! Messages after the handshake travel under XChaCha20-Poly1305 with the
+//! Key confirmation comes before any channel data: each side sends its
+//! `proof`, an HMAC of the ordered transcript under the channel key, and
+//! opens nothing until the peer's proof verifies ([`Opened::confirm`]). A
+//! side that typed another code holds another key, its proof is refused,
+//! and the halves never travel.
+//!
+//! The caller still stops after a handful of failed confirmations —
+//! SPAKE2 grants the middle one guess per ceremony, so the count is the
+//! rate limit (this module derives and confirms, it does not count).
+//!
+//! Messages after confirmation travel under XChaCha20-Poly1305 with the
 //! channel key: each message carries its own 24-byte nonce (`nonce ||
 //! ciphertext`), so a replayed message is a bit-exact duplicate the caller
 //! can spot by the nonce it already saw.
@@ -39,30 +50,36 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
-use sha2::{Digest, Sha256};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use spake2::{Ed25519Group, Identity, Password, Spake2};
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
-/// The domain tag hashed into the transcript salt.
-const SALT_TAG: &[u8] = b"ksg-pake-v1";
+/// The SPAKE2 identity string binding the exchange to this channel.
+const IDENTITY: &[u8] = b"ksg-pake-v1";
 /// The HKDF info string binding the key to this channel.
 const CHANNEL_INFO: &[u8] = b"ksg-pake-channel-v1";
-/// Length of an X25519 public key, bytes.
-const EPHEMERAL_LEN: usize = 32;
 /// Length of a 6-digit code, ASCII digits.
 const CODE_LEN: usize = 6;
+/// Length of one SPAKE2 symmetric message (Ed25519 group), bytes.
+pub const MESSAGE_LEN: usize = 33;
+/// Length of a key-confirmation proof (HMAC-SHA256), bytes.
+pub const PROOF_LEN: usize = 32;
 /// Length of the channel key, bytes.
 pub const CHANNEL_KEY_LEN: usize = 32;
 /// Length of the XChaCha20-Poly1305 nonce, bytes.
 pub const NONCE_LEN: usize = 24;
 
-/// What went wrong pairing or wrapping.
+/// What went wrong pairing, confirming, or wrapping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PakeError {
     /// The code is not 6 ASCII digits.
     BadCode,
-    /// A peer ephemeral is not 32 bytes.
-    BadEphemeral,
-    /// The AEAD tag does not verify — wrong code, wrong key, or tampering.
+    /// The peer pairing message is not a well-formed SPAKE2 message.
+    BadMessage,
+    /// The confirmation proof does not verify, or the AEAD tag does not —
+    /// wrong code, wrong key, or tampering.
     Refused,
 }
 
@@ -70,8 +87,8 @@ impl core::fmt::Display for PakeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::BadCode => f.write_str("the pairing code is not 6 digits"),
-            Self::BadEphemeral => f.write_str("the peer ephemeral is not 32 bytes"),
-            Self::Refused => f.write_str("the wrapped message does not open"),
+            Self::BadMessage => f.write_str("the peer pairing message is malformed"),
+            Self::Refused => f.write_str("the pairing is refused: wrong code or tampering"),
         }
     }
 }
@@ -102,6 +119,68 @@ impl Drop for ChannelKey {
     }
 }
 
+/// Our half of a pairing ceremony: the SPAKE2 state plus the message we
+/// sent, kept for the transcript the confirmation HMAC covers. `Debug`
+/// names it — the state holds the ephemeral scalar.
+pub struct Pairing {
+    /// The SPAKE2 state, consumed by [`open`].
+    state: Spake2<Ed25519Group>,
+    /// The message [`begin`] returned, in full.
+    outbound: [u8; MESSAGE_LEN],
+}
+
+impl core::fmt::Debug for Pairing {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Pairing(..)")
+    }
+}
+
+/// A finished pairing: the channel key plus our confirmation proof to
+/// send. Trust the key only after [`Opened::confirm`] accepts the peer's
+/// proof — before that it may be the key of a stranger's ceremony.
+pub struct Opened {
+    /// The channel key this side derived.
+    key: ChannelKey,
+    /// HMAC-SHA256(key, ordered transcript): send to the peer.
+    proof: [u8; PROOF_LEN],
+}
+
+impl Opened {
+    /// Our confirmation proof, to send to the peer before any data.
+    #[must_use]
+    pub fn proof(&self) -> &[u8; PROOF_LEN] {
+        &self.proof
+    }
+
+    /// The derived channel key. Trust it only after `confirm` accepted
+    /// the peer's proof.
+    #[must_use]
+    pub fn key(&self) -> &ChannelKey {
+        &self.key
+    }
+
+    /// Checks the peer's confirmation proof in constant time: same key on
+    /// both sides means same proof, and same proof means the peer typed
+    /// the same code. A stranger's proof is refused, and no channel data
+    /// may flow.
+    pub fn confirm(&self, peer_proof: &[u8]) -> Result<&ChannelKey, PakeError> {
+        if peer_proof.len() != PROOF_LEN {
+            return Err(PakeError::Refused);
+        }
+        if self.proof.as_slice().ct_eq(peer_proof).into() {
+            Ok(&self.key)
+        } else {
+            Err(PakeError::Refused)
+        }
+    }
+}
+
+impl core::fmt::Debug for Opened {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Opened(..)")
+    }
+}
+
 /// Checks the code is 6 ASCII digits.
 fn check_code(code: &str) -> Result<(), PakeError> {
     if code.len() == CODE_LEN && code.bytes().all(|b| b.is_ascii_digit()) {
@@ -111,54 +190,66 @@ fn check_code(code: &str) -> Result<(), PakeError> {
     }
 }
 
-/// Derives the channel key from the pairing: the holder-typed 6-digit
-/// `code`, our fresh ephemeral secret, and the peer's ephemeral public
-/// half. Both sides call it with the same code and each other's public
-/// halves, and both get the same key.
-pub fn pair(
+/// Starts our side of a pairing: validates the 6-digit `code` and returns
+/// the ceremony state plus the message to send to the peer. Both sides
+/// call it with the same code; the randomness comes from `rng` — fresh
+/// per ceremony, so no two ceremonies share a transcript.
+pub fn begin(
     code: &str,
-    our_secret: &[u8; EPHEMERAL_LEN],
-    peer_public: &[u8; EPHEMERAL_LEN],
-) -> Result<ChannelKey, PakeError> {
+    rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng),
+) -> Result<(Pairing, [u8; MESSAGE_LEN]), PakeError> {
     check_code(code)?;
-    let secret = x25519_dalek::StaticSecret::from(*our_secret);
-    let peer = x25519_dalek::PublicKey::from(*peer_public);
-    let shared = secret.diffie_hellman(&peer);
-    // `our_secret` is copied into the dalek secret above; wipe our array's
-    // twin here — the caller's own array is theirs to wipe.
-    let mut secret_copy = *our_secret;
-    secret_copy.zeroize();
+    let (state, outbound) = Spake2::<Ed25519Group>::start_symmetric_with_rng(
+        &Password::new(code.as_bytes()),
+        &Identity::new(IDENTITY),
+        &mut *rng,
+    );
+    let outbound: [u8; MESSAGE_LEN] =
+        outbound.try_into().map_err(|_| PakeError::BadMessage)?;
+    Ok((Pairing { state, outbound }, outbound))
+}
 
-    let our_public = x25519_dalek::PublicKey::from(&secret);
-    // Both sides hash the two ephemerals in the same (lexicographic)
-    // order: `our || peer` on one side is `peer || our` on the other, and
-    // the keys would never meet.
-    let ours = *our_public.as_bytes();
-    let (first, second) = if ours <= *peer_public {
-        (ours, *peer_public)
-    } else {
-        (*peer_public, ours)
-    };
-    let mut salt_hash = Sha256::new();
-    salt_hash.update(SALT_TAG);
-    salt_hash.update(code.as_bytes());
-    salt_hash.update(first);
-    salt_hash.update(second);
-    let salt = salt_hash.finalize();
-
-    let mut ikm = Vec::with_capacity(CODE_LEN + EPHEMERAL_LEN);
-    ikm.extend_from_slice(code.as_bytes());
-    ikm.extend_from_slice(shared.as_bytes());
+/// Finishes the pairing with the peer's message: runs SPAKE2 to completion,
+/// stretches the output into the channel key, and precomputes our
+/// confirmation proof over the ordered transcript. A malformed message is
+/// refused; a well-formed message under another code still finishes — the
+/// stranger is caught later, by [`Opened::confirm`].
+pub fn open(pairing: Pairing, peer_msg: &[u8]) -> Result<Opened, PakeError> {
+    if peer_msg.len() != MESSAGE_LEN {
+        return Err(PakeError::BadMessage);
+    }
+    let raw = pairing
+        .state
+        .finish(peer_msg)
+        .map_err(|_| PakeError::BadMessage)?;
+    let raw = Zeroizing::new(raw);
     let mut okm = [0u8; CHANNEL_KEY_LEN];
-    Hkdf::<Sha256>::new(Some(&salt), &ikm)
+    Hkdf::<Sha256>::new(None, &raw)
         .expand(CHANNEL_INFO, &mut okm)
         .expect("HKDF-SHA256 expands 32 bytes");
-    ikm.zeroize();
-    Ok(ChannelKey(Zeroizing::new(okm)))
+    drop(raw);
+    // Both sides order the two transcript messages the same way
+    // (lexicographic): `ours || peer` on one side is `peer || ours` on
+    // the other, and the proofs would never meet.
+    let (first, second) = if pairing.outbound.as_slice() <= peer_msg {
+        (pairing.outbound.as_slice(), peer_msg)
+    } else {
+        (peer_msg, pairing.outbound.as_slice())
+    };
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(&okm).expect("HMAC takes any key length");
+    mac.update(first);
+    mac.update(second);
+    let proof: [u8; PROOF_LEN] = mac.finalize().into_bytes().into();
+    Ok(Opened {
+        key: ChannelKey(Zeroizing::new(okm)),
+        proof,
+    })
 }
 
 /// Wraps one message under the channel key: `nonce || ciphertext`. The
 /// nonce comes from `rng` — fresh per message, never reused under one key.
+/// Send only after [`Opened::confirm`] accepted the peer.
 pub fn wrap(
     key: &ChannelKey,
     rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng),
@@ -177,8 +268,8 @@ pub fn wrap(
     out
 }
 
-/// Opens a wrapped message: the AEAD check refuses a wrong code, a wrong
-/// key, or any tampering.
+/// Opens a wrapped message: the AEAD check refuses a wrong key or any
+/// tampering.
 pub fn unwrap(key: &ChannelKey, message: &[u8]) -> Result<Vec<u8>, PakeError> {
     if message.len() < NONCE_LEN {
         return Err(PakeError::Refused);

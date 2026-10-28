@@ -1,25 +1,18 @@
-//! The phone↔reader pairing (track И19): [`pair`] turns the 6 digits
+//! The phone↔reader pairing (track И19-ф): SPAKE2 turns the 6 digits
 //! the holder typed into a channel key both sides compute — and a side
-//! with another code gets another key, so the first wrapped message
-//! refuses to open.
+//! with another code is refused at key confirmation, before any channel
+//! data flows.
 //!
 //! The ceremony the tests pin:
 //!
 //! ```text
-//! same code on both sides → the same key → the message opens
-//! another code on one side → another key → `Refused`
+//! same code on both sides → the same key → proofs match → the key is trusted
+//! another code on one side → the proofs refuse → no channel key is trusted
+//! a middle guessing a code → the holder refuses, and the guesser's key is
+//!   unrelated to the holder's: the recording alone never checks guesses
 //! ```
 
-use ksg_capsule_module::pake::{pair, unwrap, wrap, PakeError};
-
-/// One fresh ephemeral pair: the secret this side keeps, the public half
-/// it sends in the clear.
-fn ephemeral(rng: &mut TestRng) -> ([u8; 32], [u8; 32]) {
-    let mut secret = [0u8; 32];
-    rng.fill_bytes(&mut secret);
-    let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret));
-    (secret, *public.as_bytes())
-}
+use ksg_capsule_module::pake::{begin, open, unwrap, wrap, PakeError};
 
 /// A deterministic generator for the tests only: splitmix64, the same
 /// stream the session tests' stand uses. Its quality is irrelevant — what
@@ -62,83 +55,169 @@ impl rand_core::RngCore for TestRng {
 
 impl rand_core::CryptoRng for TestRng {}
 
-/// The same code on both sides derives the same channel key, and a message
-/// wrapped under it opens.
+/// The same code on both sides derives the same channel key, the
+/// confirmation proofs match, and a message wrapped under the key opens.
 #[test]
 fn the_same_code_meets_and_the_message_opens() {
     let mut rng = TestRng(41);
-    let (sec_a, pub_a) = ephemeral(&mut rng);
-    let (sec_b, pub_b) = ephemeral(&mut rng);
-    let key_a = pair("482917", &sec_a, &pub_b).expect("the phone pairs");
-    let key_b = pair("482917", &sec_b, &pub_a).expect("the reader pairs");
+    let (phone, msg_phone) = begin("482917", &mut rng).expect("the phone starts");
+    let (reader, msg_reader) = begin("482917", &mut rng).expect("the reader starts");
+    let phone = open(phone, &msg_reader).expect("the phone opens");
+    let reader = open(reader, &msg_phone).expect("the reader opens");
     assert_eq!(
-        key_a.bytes(),
-        key_b.bytes(),
+        phone.proof(),
+        reader.proof(),
+        "one ceremony, one confirmation"
+    );
+    let key_phone = phone.confirm(reader.proof()).expect("the proofs meet");
+    let key_reader = reader.confirm(phone.proof()).expect("the proofs meet");
+    assert_eq!(
+        key_phone.bytes(),
+        key_reader.bytes(),
         "one ceremony, one channel key"
     );
-    let message = wrap(&key_a, &mut rng, b"the holder half travels");
+    let message = wrap(key_phone, &mut rng, b"the holder half travels");
     assert_eq!(
-        unwrap(&key_b, &message).expect("the message opens"),
+        unwrap(key_reader, &message).expect("the message opens"),
         b"the holder half travels",
         "the channel carries"
     );
 }
 
-/// A side with another code derives another key: the first wrapped message
-/// refuses to open.
+/// A side with another code is refused at key confirmation: the proofs
+/// differ, and no channel key is trusted.
 #[test]
-fn a_stranger_code_is_refused() {
+fn a_stranger_code_is_refused_at_confirmation() {
     let mut rng = TestRng(42);
-    let (sec_a, pub_a) = ephemeral(&mut rng);
-    let (sec_b, pub_b) = ephemeral(&mut rng);
-    let key_a = pair("482917", &sec_a, &pub_b).expect("the phone pairs");
-    let stranger = pair("000000", &sec_b, &pub_a).expect("the pairing derives, not checks");
+    let (phone, msg_phone) = begin("482917", &mut rng).expect("the phone starts");
+    let (stranger, msg_stranger) = begin("000000", &mut rng).expect("the exchange runs, not checks");
+    let phone = open(phone, &msg_stranger).expect("a well-formed message opens the math");
+    let stranger = open(stranger, &msg_phone).expect("a well-formed message opens the math");
     assert_ne!(
-        key_a.bytes(),
-        stranger.bytes(),
-        "another code, another key"
+        phone.proof(),
+        stranger.proof(),
+        "another code, another confirmation"
     );
-    let message = wrap(&key_a, &mut rng, b"the holder half travels");
     assert_eq!(
-        unwrap(&stranger, &message).unwrap_err(),
+        phone.confirm(stranger.proof()).unwrap_err(),
         PakeError::Refused,
-        "the stranger code does not open the channel"
+        "the stranger proof does not confirm the channel"
+    );
+    assert_eq!(
+        stranger.confirm(phone.proof()).unwrap_err(),
+        PakeError::Refused,
+        "the phone proof does not confirm the stranger"
+    );
+    // Without a confirmed proof there is no trusted key: a message the
+    // stranger wraps under its own derived key never opens under the
+    // phone's.
+    let forged = wrap(stranger.key(), &mut rng, b"the holder half travels");
+    assert_eq!(
+        unwrap(phone.key(), &forged).unwrap_err(),
+        PakeError::Refused,
+        "unconfirmed keys never meet"
+    );
+}
+
+/// A middle that guesses a code runs the exchange against the holder, is
+/// refused at confirmation — and the recording alone never checks further
+/// guesses: opening the holder's message with the wrong-code key gives a
+/// key unrelated to the holder's.
+#[test]
+fn a_middle_guessing_a_code_learns_nothing_from_the_recording() {
+    // A and M run one ceremony: A with the true code, M with a guess.
+    let mut rng = TestRng(43);
+    let (side_a, msg_a) = begin("482917", &mut rng).expect("the holder starts");
+    let (side_m, msg_m) = begin("111111", &mut rng).expect("the middle guesses");
+    let opened_a = open(side_a, &msg_m).expect("a well-formed message opens the math");
+    let opened_m = open(side_m, &msg_a).expect("a well-formed message opens the math");
+    assert_eq!(
+        opened_a.confirm(opened_m.proof()).unwrap_err(),
+        PakeError::Refused,
+        "the holder refuses the guesser"
+    );
+    // The guesser holds only its guess-derived key — unrelated to the
+    // holder's — and re-running the recording with yet another wrong code
+    // derives yet another unrelated key: no offline check ever says "warm".
+    let (side_a2, msg_a2) = begin("482917", &mut rng).expect("the holder starts again");
+    let offline = open(side_a2, &msg_a).expect("a well-formed message opens the math");
+    void_msg(&msg_a2);
+    assert_ne!(
+        opened_a.key().bytes(),
+        opened_m.key().bytes(),
+        "the guesser's key is not the holder's"
+    );
+    assert_ne!(
+        opened_a.key().bytes(),
+        offline.key().bytes(),
+        "a fresh ceremony under the true code is a fresh key: nothing in the recording pins it"
+    );
+    assert_ne!(
+        opened_m.key().bytes(),
+        opened_m.proof(),
+        "the guesser's proof is not its key"
     );
 }
 
 /// What is not 6 ASCII digits never starts a pairing.
 #[test]
 fn what_is_not_six_digits_never_pairs() {
-    let secret = [0x11; 32];
-    let peer = [0x22; 32];
+    let mut rng = TestRng(44);
     for bad in ["", "12345", "1234567", "abcdef", "12 345"] {
         assert_eq!(
-            pair(bad, &secret, &peer).unwrap_err(),
+            begin(bad, &mut rng).unwrap_err(),
             PakeError::BadCode,
             "no pairing under {bad:?}"
         );
     }
 }
 
-/// A tampered message and a stub too short for a nonce refuse to open.
+/// A malformed peer message and a tampered message are refused; a stub
+/// too short for a nonce never opens.
 #[test]
-fn tampering_and_a_stub_are_refused() {
-    let mut rng = TestRng(43);
-    let (sec_a, pub_a) = ephemeral(&mut rng);
-    let (sec_b, pub_b) = ephemeral(&mut rng);
-    let key_a = pair("482917", &sec_a, &pub_b).expect("the phone pairs");
-    let key_b = pair("482917", &sec_b, &pub_a).expect("the reader pairs");
-    let mut message = wrap(&key_a, &mut rng, b"the holder half travels");
+fn malformed_tampered_and_stub_are_refused() {
+    let mut rng = TestRng(45);
+    let (phone, _) = begin("482917", &mut rng).expect("the phone starts");
+    let (reader, msg_reader) = begin("482917", &mut rng).expect("the reader starts");
+    assert_eq!(
+        open(phone, &msg_reader[..7]).unwrap_err(),
+        PakeError::BadMessage,
+        "a stub holds no SPAKE2 message"
+    );
+    let (phone, _) = begin("482917", &mut rng).expect("the phone restarts");
+    let mut bad = msg_reader;
+    bad[0] ^= 0x01;
+    assert_eq!(
+        open(phone, &bad).unwrap_err(),
+        PakeError::BadMessage,
+        "a flipped byte breaks the pairing message"
+    );
+    let (phone, msg_phone) = begin("482917", &mut rng).expect("the phone restarts");
+    let phone = open(phone, &msg_reader).expect("the phone opens");
+    let reader = open(reader, &msg_phone).expect("the reader opens");
+    let key_phone = phone.confirm(reader.proof()).expect("the proofs meet");
+    let key_reader = reader.confirm(phone.proof()).expect("the proofs meet");
+    let mut message = wrap(key_phone, &mut rng, b"the holder half travels");
     let last = message.len() - 1;
     message[last] ^= 0x01;
     assert_eq!(
-        unwrap(&key_b, &message).unwrap_err(),
+        unwrap(key_reader, &message).unwrap_err(),
         PakeError::Refused,
         "a flipped byte breaks the seal"
     );
     assert_eq!(
-        unwrap(&key_b, &message[..7]).unwrap_err(),
+        unwrap(key_reader, &message[..7]).unwrap_err(),
         PakeError::Refused,
         "a stub holds no nonce"
     );
+    // A confirmation proof of the wrong length is refused, not panicked.
+    assert_eq!(
+        phone.confirm(&message[..7]).unwrap_err(),
+        PakeError::Refused,
+        "a stub holds no proof"
+    );
 }
+
+/// Marks a message as intentionally unused: the MITM test re-runs the
+/// ceremony and keeps the recording message of the first one only.
+fn void_msg(_: &[u8; 33]) {}
