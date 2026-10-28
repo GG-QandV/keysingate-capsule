@@ -390,8 +390,22 @@ enum PageToWrite {
     Record(RecordKind, Piece),
 }
 
-/// One opened capsule with the container in memory: one session per module
-/// instance (`Spec_kapsula` §10 п. 3).
+/// What a repeated command still owes the press (И6б): the offsets its
+/// open press already ticked. While the press stays open — a `Needs*`
+/// answer — a repeat reuses them, so the wire round signs the same bytes
+/// and the closed round is picked up instead of a new one. A successful,
+/// refused, or anchor-owed press drops them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PressOffsets {
+    /// The text the pending `Work` press was opened with.
+    work_text: Option<String>,
+    /// The offset page 0 of a pending opening was ticked with.
+    open_offset: Option<u64>,
+    /// The offsets the pending `Work` page drafts were ticked with.
+    page_offsets: Vec<u64>,
+    /// The offsets the pending status records were ticked with.
+    status_offsets: Vec<u64>,
+}
 ///
 /// Secrets the session holds — the state key, the client's mobile half — are
 /// wiped when it drops: `Zeroizing` and the `Drop` of the halves, not a manual
@@ -469,6 +483,9 @@ pub struct Session {
     /// without removing: a repeated command reuses what its earlier round
     /// closed, and a successful press drops them all.
     pending_client_sigs: Vec<(Vec<u8>, Vec<Signature>)>,
+    /// What a repeated command still owes the press (И6б): the offsets its
+    /// open press already ticked — see [`PressOffsets`].
+    press_offsets: PressOffsets,
     /// The anchors the network still owes this session, oldest first — a
     /// seal before its status record. A press in Pro queues them and answers
     /// the head; each [`Request::Reanchor`] takes the head off and answers
@@ -599,6 +616,7 @@ impl Session {
             client_round: None,
             client_round_msg: None,
             pending_client_sigs: Vec::new(),
+            press_offsets: PressOffsets::default(),
             pending_anchors: std::collections::VecDeque::new(),
         };
         for (i, raw) in anchored.iter().enumerate() {
@@ -1258,7 +1276,21 @@ impl Session {
                 .map_err(|e| Answer::Refused {
                     reason: format!("the opening does not seal: {e}"),
                 })?;
-        let seal = self.sign_client(&bytes)?;
+        // The offset stays ticked while the press is open (И6б): a repeated
+        // `OpenJournal` re-seals the same bytes — the wire round signs them,
+        // the closed round is picked up. A successful press clears it (see
+        // `Session::clear_opening`); a refusal drops it below.
+        let seal = match self.sign_client(&bytes) {
+            Ok(seal) => seal,
+            Err(needs) => {
+                if Self::is_wait_answer(&needs) {
+                    self.pending_open_offset = Some(offset_ms);
+                } else {
+                    self.pending_open_offset = None;
+                }
+                return Err(needs);
+            }
+        };
         let pro = self.container.opening_form() == ksg_core_v2::journal::Mode::Pro;
         if !pro {
             self.pending_open_offset = None;
@@ -1571,16 +1603,16 @@ impl Session {
     /// for one — is refused: one round at a time, and only for a command
     /// that asked.
     fn client_commit(&mut self, raw: &[u8]) -> Answer {
-        let Some(open) = self.client_round_msg() else {
-            return Answer::Refused {
-                reason: "no client round waits for a commitment".into(),
-            };
-        };
         if self.client_round.is_some() {
             return Answer::Refused {
                 reason: "a client round is already open: answer it with a share".into(),
             };
         }
+        let Some(open) = self.client_round_msg() else {
+            return Answer::Refused {
+                reason: "no client round waits for a commitment".into(),
+            };
+        };
         let commitment = match Commitment::from_bytes(raw) {
             Ok(c) => c,
             Err(e) => {
@@ -1708,9 +1740,38 @@ impl Session {
         };
         event.covered = event.subject();
         let covered = event.covered.clone();
-        event.signatures = self.sign_all(&covered, who)?;
-        let (page, page_need) = self.opening_page_or(page)?;
-        let (status, status_need) = self.status_record(op)?;
+        match self.sign_all(&covered, who) {
+            Ok(sigs) => {
+                event.signatures = sigs;
+            }
+            Err(needs) => {
+                // The press stays open, the offsets stay ticked: a repeat
+                // re-signs the same bytes (И6б). A refusal drops them — its
+                // press wrote nothing and opens fresh next time.
+                if !Self::is_wait_answer(&needs) {
+                    self.press_offsets = PressOffsets::default();
+                }
+                return Err(needs);
+            }
+        }
+        let (page, page_need) = match self.opening_page_or(page) {
+            Ok(w) => w,
+            Err(needs) => {
+                if !Self::is_wait_answer(&needs) {
+                    self.press_offsets = PressOffsets::default();
+                }
+                return Err(needs);
+            }
+        };
+        let (status, status_need) = match self.status_record(op) {
+            Ok(w) => w,
+            Err(needs) => {
+                if !Self::is_wait_answer(&needs) {
+                    self.press_offsets = PressOffsets::default();
+                }
+                return Err(needs);
+            }
+        };
         let keys = self.container.roster().keys().clone();
         let at_ms = Some(self.clock_ms);
         self.container
@@ -1728,6 +1789,13 @@ impl Session {
             .map_err(|e| Answer::Refused {
                 reason: format!("refused: {e}"),
             })?;
+        self.press_offsets = PressOffsets::default();
+        self.pending_client_sigs.clear();
+        // The opening's offset went in with the press (see
+        // `Session::opening_page`): a later opening ticks fresh.
+        if !self.pending_opening {
+            self.pending_open_offset = None;
+        }
         if self.container.is_pro() {
             if let Some(need) = page_need {
                 self.pending_anchors.push_back(need);
@@ -1740,6 +1808,18 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// A `Needs*` answer that waits for the reader — the press stays open, a
+    /// repeated command resumes it — rather than a refusal, which drops it.
+    fn is_wait_answer(answer: &Answer) -> bool {
+        matches!(
+            answer,
+            Answer::NeedsClientCommit { .. }
+                | Answer::NeedsShare { .. }
+                | Answer::NeedsSignature { .. }
+                | Answer::NeedsAnchor { .. }
+        )
     }
 
     /// The page a command writes: page 0 through its own co-seal round trip,
@@ -1770,7 +1850,20 @@ impl Session {
             }
             PageToWrite::Record(kind, content) => (kind, content),
         };
-        let offset_ms = self.tick();
+        // A repeated command reuses the offsets its open press ticked (И6б):
+        // the draft — and the seal bytes the wire round signs — stays the
+        // same, so the closed round is picked up instead of a new one.
+        let offset_ms = match self.press_offsets.page_offsets.pop() {
+            Some(ticked) => {
+                self.press_offsets.page_offsets.push(ticked);
+                ticked
+            }
+            None => {
+                let ticked = self.tick();
+                self.press_offsets.page_offsets.push(ticked);
+                ticked
+            }
+        };
         let draft = self
             .container
             .draft_record(
@@ -1850,7 +1943,19 @@ impl Session {
             number: self.container.status_records() as u64,
             status: next,
             event: Some(event),
-            offset_ms: self.tick(),
+            // A repeated command reuses the offsets its open press ticked
+            // (И6б) — see `Session::page`.
+            offset_ms: match self.press_offsets.status_offsets.pop() {
+                Some(ticked) => {
+                    self.press_offsets.status_offsets.push(ticked);
+                    ticked
+                }
+                None => {
+                    let ticked = self.tick();
+                    self.press_offsets.status_offsets.push(ticked);
+                    ticked
+                }
+            },
             prev: self.container.status_head(),
             signatures: SignatureSet::default(),
         };
