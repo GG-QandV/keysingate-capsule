@@ -6,10 +6,11 @@
 //! The ceremony the tests pin:
 //!
 //! ```text
-//! same code on both sides → the same key → proofs match → the key is trusted
+//! same code on both sides → the same key → the proofs meet crosswise → the key is trusted
 //! another code on one side → the proofs refuse → no channel key is trusted
 //! a middle guessing a code → the holder refuses, and the guesser's key is
 //!   unrelated to the holder's: the recording alone never checks guesses
+//! a reflected proof (ours bounced back) → refused: proofs are direction-bound
 //! ```
 
 use ksg_capsule_module::pake::{begin, open, unwrap, wrap, PakeError};
@@ -64,10 +65,10 @@ fn the_same_code_meets_and_the_message_opens() {
     let (reader, msg_reader) = begin("482917", &mut rng).expect("the reader starts");
     let phone = open(phone, &msg_reader).expect("the phone opens");
     let reader = open(reader, &msg_phone).expect("the reader opens");
-    assert_eq!(
+    assert_ne!(
         phone.proof(),
         reader.proof(),
-        "one ceremony, one confirmation"
+        "proofs are direction-bound: ours is not theirs"
     );
     let key_phone = phone.confirm(reader.proof()).expect("the proofs meet");
     let key_reader = reader.confirm(phone.proof()).expect("the proofs meet");
@@ -157,6 +158,32 @@ fn a_middle_guessing_a_code_learns_nothing_from_the_recording() {
         opened_m.proof(),
         "the guesser's proof is not its key"
     );
+}
+
+/// A proof bounced back at its sender is refused: the proofs are
+/// direction-bound, so a middle that returns a side's own confirmation
+/// is not mistaken for the peer.
+#[test]
+fn a_reflected_proof_is_refused() {
+    let mut rng = TestRng(46);
+    let (phone, msg_phone) = begin("482917", &mut rng).expect("the phone starts");
+    let (reader, msg_reader) = begin("482917", &mut rng).expect("the reader starts");
+    let phone = open(phone, &msg_reader).expect("the phone opens");
+    let reader = open(reader, &msg_phone).expect("the reader opens");
+    assert_eq!(
+        phone.confirm(phone.proof()).unwrap_err(),
+        PakeError::Refused,
+        "our own proof is not the peer's"
+    );
+    assert_eq!(
+        reader.confirm(reader.proof()).unwrap_err(),
+        PakeError::Refused,
+        "our own proof is not the peer's"
+    );
+    // Crosswise the ceremony still meets: the reflection changes nothing
+    // for the honest peer.
+    phone.confirm(reader.proof()).expect("the proofs meet");
+    reader.confirm(phone.proof()).expect("the proofs meet");
 }
 
 /// What is not 6 ASCII digits never starts a pairing.

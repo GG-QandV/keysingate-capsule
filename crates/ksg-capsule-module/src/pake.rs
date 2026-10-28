@@ -19,8 +19,16 @@
 //! code  = the 6 digits the holder typed (21 bits of entropy)
 //! raw   = SPAKE2-symmetric(code, identity "ksg-pake-v1", msg_a, msg_b)
 //! key   = HKDF-SHA256(raw, info "ksg-pake-channel-v1")
-//! proof = HMAC-SHA256(key, ordered(msg_a, msg_b))
+//! proof(A→B) = HMAC-SHA256(key, "ksg-confirm-v1" || msg_a || msg_b)
+//! proof(B→A) = HMAC-SHA256(key, "ksg-confirm-v1" || msg_b || msg_a)
 //! ```
+//!
+//! The two confirmation proofs differ by direction on purpose: each side
+//! sends its own and expects the mirror. If both proofs were the same
+//! value, a middle could bounce a side's proof back at it — a reflection —
+//! and be accepted without ever meeting anyone who typed the code. With
+//! direction-bound proofs a reflected proof is refused ([`Opened::confirm`]
+//! checks against the expected mirror, never against what was sent).
 //!
 //! SPAKE2 is a password-authenticated key exchange: a passive listener
 //! learns nothing about the code or the key, and an active
@@ -31,10 +39,11 @@
 //! messages are fresh, and only the live peer's confirmation decides.
 //!
 //! Key confirmation comes before any channel data: each side sends its
-//! `proof`, an HMAC of the ordered transcript under the channel key, and
-//! opens nothing until the peer's proof verifies ([`Opened::confirm`]). A
-//! side that typed another code holds another key, its proof is refused,
-//! and the halves never travel.
+//! own proof — an HMAC of its own message first, then the peer's, under
+//! the channel key — and opens nothing until the peer's proof verifies
+//! against the mirror ([`Opened::confirm`]). A side that typed another
+//! code holds another key, its proof is refused, and the halves never
+//! travel.
 //!
 //! The caller still stops after a handful of failed confirmations —
 //! SPAKE2 grants the middle one guess per ceremony, so the count is the
@@ -60,6 +69,8 @@ use zeroize::{Zeroize, Zeroizing};
 const IDENTITY: &[u8] = b"ksg-pake-v1";
 /// The HKDF info string binding the key to this channel.
 const CHANNEL_INFO: &[u8] = b"ksg-pake-channel-v1";
+/// The confirmation label binding a proof to this channel.
+const CONFIRM_LABEL: &[u8] = b"ksg-confirm-v1";
 /// Length of a 6-digit code, ASCII digits.
 const CODE_LEN: usize = 6;
 /// Length of one SPAKE2 symmetric message (Ed25519 group), bytes.
@@ -136,13 +147,17 @@ impl core::fmt::Debug for Pairing {
 }
 
 /// A finished pairing: the channel key plus our confirmation proof to
-/// send. Trust the key only after [`Opened::confirm`] accepts the peer's
-/// proof — before that it may be the key of a stranger's ceremony.
+/// send (ours first, then the peer's) and the proof we expect back (the
+/// peer's first, then ours). Trust the key only after
+/// [`Opened::confirm`] accepts the peer's proof — before that it may be
+/// the key of a stranger's ceremony.
 pub struct Opened {
     /// The channel key this side derived.
     key: ChannelKey,
-    /// HMAC-SHA256(key, ordered transcript): send to the peer.
+    /// HMAC-SHA256(key, "ksg-confirm-v1" || our_msg || peer_msg): ours.
     proof: [u8; PROOF_LEN],
+    /// HMAC-SHA256(key, "ksg-confirm-v1" || peer_msg || our_msg): theirs.
+    expected: [u8; PROOF_LEN],
 }
 
 impl Opened {
@@ -160,14 +175,15 @@ impl Opened {
     }
 
     /// Checks the peer's confirmation proof in constant time: same key on
-    /// both sides means same proof, and same proof means the peer typed
-    /// the same code. A stranger's proof is refused, and no channel data
-    /// may flow.
+    /// both sides means the peer's proof equals our `expected`, and equal
+    /// means the peer typed the same code. A stranger's proof — and our
+    /// own proof bounced back at us (a reflection) — is refused, and no
+    /// channel data may flow.
     pub fn confirm(&self, peer_proof: &[u8]) -> Result<&ChannelKey, PakeError> {
         if peer_proof.len() != PROOF_LEN {
             return Err(PakeError::Refused);
         }
-        if self.proof.as_slice().ct_eq(peer_proof).into() {
+        if self.expected.as_slice().ct_eq(peer_proof).into() {
             Ok(&self.key)
         } else {
             Err(PakeError::Refused)
@@ -228,22 +244,26 @@ pub fn open(pairing: Pairing, peer_msg: &[u8]) -> Result<Opened, PakeError> {
         .expand(CHANNEL_INFO, &mut okm)
         .expect("HKDF-SHA256 expands 32 bytes");
     drop(raw);
-    // Both sides order the two transcript messages the same way
-    // (lexicographic): `ours || peer` on one side is `peer || ours` on
-    // the other, and the proofs would never meet.
-    let (first, second) = if pairing.outbound.as_slice() <= peer_msg {
-        (pairing.outbound.as_slice(), peer_msg)
-    } else {
-        (peer_msg, pairing.outbound.as_slice())
-    };
-    let mut mac =
+    // The proofs are direction-bound: ours covers `ours || peer`, the
+    // expected one covers `peer || ours`. Both sides compute the same
+    // pair — what we send is what the peer expects — and a proof bounced
+    // back at its sender (a reflection) matches nothing.
+    let mut ours =
         <Hmac<Sha256> as Mac>::new_from_slice(&okm).expect("HMAC takes any key length");
-    mac.update(first);
-    mac.update(second);
-    let proof: [u8; PROOF_LEN] = mac.finalize().into_bytes().into();
+    ours.update(CONFIRM_LABEL);
+    ours.update(&pairing.outbound);
+    ours.update(peer_msg);
+    let ours: [u8; PROOF_LEN] = ours.finalize().into_bytes().into();
+    let mut theirs =
+        <Hmac<Sha256> as Mac>::new_from_slice(&okm).expect("HMAC takes any key length");
+    theirs.update(CONFIRM_LABEL);
+    theirs.update(peer_msg);
+    theirs.update(&pairing.outbound);
+    let theirs: [u8; PROOF_LEN] = theirs.finalize().into_bytes().into();
     Ok(Opened {
         key: ChannelKey(Zeroizing::new(okm)),
-        proof,
+        proof: ours,
+        expected: theirs,
     })
 }
 
