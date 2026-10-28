@@ -463,8 +463,12 @@ pub struct Session {
     /// commitment names no message — it answers this one.
     client_round_msg: Option<Vec<u8>>,
     /// The wire round's signatures, waiting for the command to be repeated:
-    /// the message they sign, and the signatures themselves.
-    pending_client_sigs: Option<(Vec<u8>, Vec<Signature>)>,
+    /// one entry per message the command asked the round to sign — a `Work`
+    /// press signs its event and its seal, two messages, two rounds, so one
+    /// slot is not enough. Entries are keyed by the message and picked up
+    /// without removing: a repeated command reuses what its earlier round
+    /// closed, and a successful press drops them all.
+    pending_client_sigs: Vec<(Vec<u8>, Vec<Signature>)>,
     /// The anchors the network still owes this session, oldest first — a
     /// seal before its status record. A press in Pro queues them and answers
     /// the head; each [`Request::Reanchor`] takes the head off and answers
@@ -594,7 +598,7 @@ impl Session {
             pending_open_owner: None,
             client_round: None,
             client_round_msg: None,
-            pending_client_sigs: None,
+            pending_client_sigs: Vec::new(),
             pending_anchors: std::collections::VecDeque::new(),
         };
         for (i, raw) in anchored.iter().enumerate() {
@@ -747,7 +751,10 @@ impl Session {
         }
     }
 
-    /// E-5: one record of work, sealed by the client's two halves.
+    /// E-5: one record of work, sealed by the client's two halves — and,
+    /// with no half inside (И4в), through the wire round: the reader answers
+    /// each `NeedsClientCommit`/`NeedsShare` in turn and repeats `Work`
+    /// until `Done` (an event and its seal are two messages, so two rounds).
     fn work(&mut self, text: &str) -> Answer {
         if !self.container.born() {
             return Answer::Refused {
@@ -1470,20 +1477,21 @@ impl Session {
     /// container's inside. The round is opened and closed in one call — the
     /// capsule model keeps both halves in one process for the demo (Л-10).
     ///
-    /// With no half inside ([`Session::finish_birth_request`], И4в), the
-    /// round spans the wire instead: [`Answer::NeedsClientCommit`] carries
-    /// the message both halves sign, [`Request::ClientCommit`] opens the
+    /// The round of the client's split key is the bridge, not the
+    /// signature: with no half inside ([`Session::finish_birth_request`],
+    /// И4в), every client signature spans the wire — round by round, each
+    /// message its own open. [`Answer::NeedsClientCommit`] carries the
+    /// message both halves sign, [`Request::ClientCommit`] opens the
     /// container's side of it, [`Answer::NeedsShare`] carries the round the
     /// mobile side signs, and [`Request::ClientShare`] closes it. A session
     /// that already holds the half signs at once, as before.
     fn sign_client(&mut self, msg: &[u8]) -> Result<Vec<Signature>, Answer> {
         // The wire round's signatures wait for the repeated command: the
-        // same message picks them up, another message drops them — they
-        // sign exactly what the round signed.
-        if let Some((waiting, sigs)) = self.pending_client_sigs.take() {
-            if waiting == msg {
-                return Ok(sigs);
-            }
+        // same message picks up the round it closed — another message for a
+        // command whose signature was refused opens its own round; they sign
+        // exactly what each round signed.
+        if let Some((_, sigs)) = self.pending_client_sigs.iter().find(|(m, _)| m == msg) {
+            return Ok(sigs.clone());
         }
         if self.mobile.is_some() {
             return self.sign_client_local(msg);
@@ -1618,7 +1626,7 @@ impl Session {
         match self.container.finish_signing(&share, &mut rng) {
             Ok(sigs) => {
                 let len = open.msg.len();
-                self.pending_client_sigs = Some((open.msg, sigs));
+                self.pending_client_sigs.push((open.msg, sigs));
                 Answer::Done {
                     bytes: serde_json::to_vec(&serde_json::json!({
                         "accepted": len,
