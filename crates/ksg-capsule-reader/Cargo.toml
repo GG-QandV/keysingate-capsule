@@ -38,7 +38,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 
 [dev-dependencies]
 # K5: the export is checked by the verifier itself, not by a copy of its rules.
-ksg-verify-v2 = { path = "../ksg-verify-v2", default-features = false }
+ksg-verify-v2 = { path = "../ksg-verify-v2", default-features = false, features = ["rpc"] }
 # The test stand's container: the module's own kit is private, so the reader's
 # K5 test prints through the stand exactly as `init` does.
 ksg-capsule-module = { path = "../ksg-capsule-module" }

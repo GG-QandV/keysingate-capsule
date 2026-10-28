@@ -351,6 +351,31 @@ fn finish(layout: &Layout, session: Session) -> Result<Vec<Vec<u8>>, String> {
     Ok(outputs)
 }
 
+/// The owner's signature over the bytes a `NeedsSignature` handed out, on
+/// the wire (the JSON of a `Signature`). The owner's half is its Ed25519
+/// seed: the reader signs with it outside the module, the module checks
+/// inside (Л-1).
+fn owner_signature(layout: &Layout, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let owner = SideFile::read(&layout.owner_side())?;
+    if owner.role != Role::Owner {
+        return Err("owner.side: not the owner's file".into());
+    }
+    let seed = Zeroizing::new(
+        B64.decode(&owner.half)
+            .map_err(|_| "owner.side: the half is not base64url".to_string())?,
+    );
+    let seed: [u8; 32] = seed
+        .as_slice()
+        .try_into()
+        .map_err(|_| "owner.side: the half is not a 32-byte seed".to_string())?;
+    let signer = Ed25519Signer::from_seed(
+        Uri::parse(kid::OWNER).map_err(|e| format!("owner kid: {e}"))?,
+        seed,
+    );
+    let signature = signer.sign(bytes);
+    serde_json::to_vec(&signature).map_err(|e| format!("signature: {e}"))
+}
+
 /// E-4 through the capsule: the client's key is born, the owner signs the
 /// bytes the module asks for (the signature is made **outside** the module by
 /// the owner's file), the half goes into the client's side file.
@@ -371,27 +396,9 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
     let answer = anchor_and_reanchor(layout, &mut session, first, Party::Client)?;
     let answer = match answer {
         Answer::NeedsSignature { bytes, .. } => {
-            // The owner's half is its Ed25519 seed: the reader signs with it
-            // and hands the signature back in (`Request::Sign`).
-            let owner = SideFile::read(&layout.owner_side())?;
-            if owner.role != Role::Owner {
-                return Err("owner.side: not the owner's file".into());
-            }
-            let seed = Zeroizing::new(
-                B64.decode(&owner.half)
-                    .map_err(|_| "owner.side: the half is not base64url".to_string())?,
-            );
-            let seed: [u8; 32] = seed
-                .as_slice()
-                .try_into()
-                .map_err(|_| "owner.side: the half is not a 32-byte seed".to_string())?;
-            let signer = Ed25519Signer::from_seed(
-                Uri::parse(kid::OWNER).map_err(|e| format!("owner kid: {e}"))?,
-                seed,
-            );
-            let signature = signer.sign(&bytes);
-            let wire = serde_json::to_vec(&signature).map_err(|e| format!("signature: {e}"))?;
-            session.call(&Request::Sign { signature: wire })?
+            let wire = owner_signature(layout, &bytes)?;
+            let signed = session.call(&Request::Sign { signature: wire })?;
+            anchor_and_reanchor(layout, &mut session, signed, Party::Client)?
         }
         other => other,
     };
@@ -400,13 +407,22 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
         serde_json::from_slice(&bytes).map_err(|e| format!("the initiation: {e}"))?;
     // The journal opens in the same session (E-5, page 0): the capsule's
     // commands are `work` from here, as on the stand after `open-journal`.
+    // In Pro page 0 carries the owner's co-seal (CH-26): a client's session
+    // answers `NeedsSignature`, the reader signs outside the module.
     let first = session.call(&Request::OpenJournal)?;
-    let opening = done(anchor_and_reanchor(
-        layout,
-        &mut session,
-        first,
-        Party::Client,
-    )?)?;
+    let opening = match anchor_and_reanchor(layout, &mut session, first, Party::Client)? {
+        Answer::NeedsSignature { bytes, .. } => {
+            let wire = owner_signature(layout, &bytes)?;
+            let signed = session.call(&Request::Sign { signature: wire })?;
+            done(anchor_and_reanchor(
+                layout,
+                &mut session,
+                signed,
+                Party::Client,
+            )?)?
+        }
+        other => done(other)?,
+    };
     let opening: serde_json::Value =
         serde_json::from_slice(&opening).map_err(|e| format!("the opening: {e}"))?;
     if let Some(map) = value.as_object_mut() {

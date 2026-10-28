@@ -555,7 +555,7 @@ impl Session {
     /// | [`Request::ExportPage`] | the page as JSON, as `ksg-verify-v2` reads it — the same bytes the session keeps in its outputs |
     /// | [`Request::Initiate`] | `{"container": "<multihash>", "mobile_half": "<base64url>", "share_commitment": "<base64url>"}` |
     /// | [`Request::OpenJournal`] | `{"pages": n, "seal": "<multihash>"}` |
-    /// | [`Request::Reanchor`] | empty |
+    /// | [`Request::Reanchor`] | the last owed anchor settled: `{"pages", "seal"}`, as the opening's |
     /// | [`Request::Sign`] | the same as the command whose signature was missing |
     pub fn call(&mut self, request: Request) -> Answer {
         match request {
@@ -1181,7 +1181,14 @@ impl Session {
                     let id = *self.container.id();
                     return self.birth_done(id);
                 }
-                Answer::Done { bytes: Vec::new() }
+                Answer::Done {
+                    bytes: serde_json::json!({
+                        "pages": self.container.pages(),
+                        "seal": self.container.top_seal_hash().map(|h| h.to_multihash()),
+                    })
+                    .to_string()
+                    .into_bytes(),
+                }
             }
             Err(reason) => Answer::Refused { reason },
         }
