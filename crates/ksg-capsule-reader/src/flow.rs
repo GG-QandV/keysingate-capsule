@@ -224,7 +224,9 @@ pub fn init(layout: &Layout, print: &Print) -> Result<String, String> {
     )
     .map_err(|e| format!("parties.json: {e}"))?;
     let owner = Zeroizing::new(*owner_seed(&seeds)?);
-    let owner_file = SideFile::new(Role::Owner, &meta.id, owner.as_slice(), &map, &scan);
+    // И26: the owner's scan key is born at the recipient's — its own seed
+    // from the process's CSPRNG at handover, never the stand's copy.
+    let owner_file = SideFile::new(Role::Owner, &meta.id, owner.as_slice(), &map, &fresh_scan_seed());
     owner_file.write(&layout.owner_side())?;
     if let Some(anchor) = &print.anchor {
         save_anchor(layout, anchor)?;
@@ -406,6 +408,15 @@ fn owner_signature(layout: &Layout, bytes: &[u8]) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&signature).map_err(|e| format!("signature: {e}"))
 }
 
+/// A fresh scan seed from the process's CSPRNG: the scan key a party's
+/// file carries is born at the recipient's, not copied from the stand.
+fn fresh_scan_seed() -> [u8; 32] {
+    use rand_core::RngCore as _;
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    seed
+}
+
 /// E-4 through the capsule, in the stand: the client's key is born with the
 /// mobile half held here, the owner signs what the module asks for (the
 /// signature is made **outside** the module by the owner's file), and the
@@ -480,13 +491,16 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
 
     // The half is the client's: the mobile side kept it, and the reader held
     // it through the birth — the client's file, or the client could never
-    // sign again.
+    // sign again. The scan key is born at the recipient's (И26): from
+    // initiation on the client's file carries its own scan seed, never the
+    // stand's copy again.
     let mut file = SideFile::read(&layout.client_side())?;
     file.half = B64.encode(
         half.to_bytes()
             .map_err(|e| format!("the mobile half does not encode: {e}"))?
             .as_slice(),
     );
+    file.scan = B64.encode(fresh_scan_seed());
     file.write(&layout.client_side())?;
     Ok(value)
 }
@@ -684,6 +698,13 @@ fn initiate_remote_birth(
         map.insert("client".into(), serde_json::Value::String(named.into()));
     }
     finish(layout, session)?;
+    // The scan key is born at the recipient's (И26): a `--mobile-web`
+    // initiation writes no half, and the client's file keeps the half-less
+    // shape — but its scan seed is its own from initiation on, never the
+    // stand's copy again.
+    let mut file = SideFile::read(&layout.client_side())?;
+    file.scan = B64.encode(fresh_scan_seed());
+    file.write(&layout.client_side())?;
     Ok(value)
 }
 
