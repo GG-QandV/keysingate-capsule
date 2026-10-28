@@ -388,6 +388,22 @@ pub struct Session {
     /// The other party's signature over [`Session::pending_bytes`], handed in
     /// by [`Request::Sign`] while a birth waits for it.
     pending_owner: Option<Signature>,
+    /// Page 0 waiting for the owner's co-seal in Pro (CH-26): a client's
+    /// session cannot seal the opening alone, so [`Request::OpenJournal`]
+    /// answers [`Answer::NeedsSignature`] and the owner's [`Request::Sign`]
+    /// presses it — the same round trip as an initiation. Never set together
+    /// with `pending_birth`: a birth waits before the container is born, an
+    /// opening after.
+    pending_opening: bool,
+    /// The opening seal's bytes the owner co-signs — the exact bytes the
+    /// container checks, as on the stand.
+    pending_open_bytes: Vec<u8>,
+    /// The offset page 0 was ticked with: ticked once and reused while the
+    /// owner's signature is missing, so a retry signs the same bytes.
+    pending_open_offset: Option<u64>,
+    /// The owner's co-seal over [`Session::pending_open_bytes`], handed in
+    /// by [`Request::Sign`] while an opening waits for it.
+    pending_open_owner: Option<Signature>,
     /// The anchors the network still owes this session, oldest first — a
     /// seal before its status record. A press in Pro queues them and answers
     /// the head; each [`Request::Reanchor`] takes the head off and answers
@@ -511,6 +527,10 @@ impl Session {
             pending_birth: false,
             pending_bytes: Vec::new(),
             pending_owner: None,
+            pending_opening: false,
+            pending_open_bytes: Vec::new(),
+            pending_open_offset: None,
+            pending_open_owner: None,
             pending_anchors: std::collections::VecDeque::new(),
         };
         for (i, raw) in anchored.iter().enumerate() {
@@ -575,6 +595,13 @@ impl Session {
             return Err(
                 "a birth is pending: the client's key is made and not yet pressed, and a birth \
                  is never stored — press the initiation or cancel it before closing"
+                    .into(),
+            );
+        }
+        if self.pending_opening {
+            return Err(
+                "an opening is pending: page 0 waits for the owner's co-seal — answer the \
+                 NeedsSignature with a Sign before closing"
                     .into(),
             );
         }
@@ -901,10 +928,23 @@ impl Session {
     }
 
     /// E-5: the journal opens — page 0, sealed by the client's two halves.
+    ///
+    /// Pro opens with the owner's seal and the anchor (CH-26), as on the
+    /// stand: a client's session answers [`Answer::NeedsSignature`] with the
+    /// seal's bytes, and the owner's [`Request::Sign`] presses page 0 — the
+    /// same round trip as an initiation. An owner's session seals at once.
     fn open_journal(&mut self) -> Answer {
         if !self.container.born() {
             return Answer::Refused {
                 reason: "the container is not initiated: the journal opens after E-4".into(),
+            };
+        }
+        if self.pending_opening {
+            // A second call while the owner's co-seal is still missing: the
+            // same answer, the same bytes — the opening is not re-ticked.
+            return Answer::NeedsSignature {
+                party: Party::Owner.name().into(),
+                bytes: self.pending_open_bytes.clone(),
             };
         }
         match self.press(
@@ -913,41 +953,129 @@ impl Session {
             &Evidence::None,
             PageToWrite::Opening,
         ) {
-            Ok(()) => Answer::Done {
-                bytes: serde_json::json!({
-                    "pages": self.container.pages(),
-                    "seal": self.container.top_seal_hash().map(|h| h.to_multihash()),
-                })
-                .to_string()
-                .into_bytes(),
-            },
-            Err(answer) => answer,
+            Ok(()) => {
+                self.clear_opening();
+                Answer::Done {
+                    bytes: serde_json::json!({
+                        "pages": self.container.pages(),
+                        "seal": self.container.top_seal_hash().map(|h| h.to_multihash()),
+                    })
+                    .to_string()
+                    .into_bytes(),
+                }
+            }
+            Err(owed @ Answer::NeedsAnchor { .. }) => {
+                self.clear_opening();
+                owed
+            }
+            Err(still @ Answer::NeedsSignature { .. }) => still,
+            Err(refused) => refused,
         }
     }
 
-    /// Page 0: the opening's seal, signed by the client's two halves.
-    fn opening_page(&mut self) -> Result<Option<JournalWrite>, Answer> {
-        let offset_ms = self.tick();
-        let (bytes, _hash) =
+    /// The opening's pending co-seal state goes: the press went in (its
+    /// anchor, if any, now lives in the queue) or with it.
+    fn clear_opening(&mut self) {
+        self.pending_opening = false;
+        self.pending_open_bytes.clear();
+        self.pending_open_offset = None;
+        self.pending_open_owner = None;
+    }
+
+    /// Page 0: the opening's seal, signed by the client's two halves — and,
+    /// in Pro, the owner's co-seal and the placeholder anchor (CH-26), as the
+    /// stand presses it. The seal's anchor goes back with the write: in Pro
+    /// the press queues it, and the reader's [`Request::Reanchor`] swaps the
+    /// placeholder for the network's attestation.
+    fn opening_page(
+        &mut self,
+    ) -> Result<(Option<JournalWrite>, Option<AnchorNeed>), Answer> {
+        let offset_ms = match self.pending_open_offset {
+            Some(ticked) => ticked,
+            None => self.tick(),
+        };
+        let (bytes, hash) =
             self.container
                 .opening_seal(offset_ms)
                 .map_err(|e| Answer::Refused {
                     reason: format!("the opening does not seal: {e}"),
                 })?;
         let seal = self.sign_client(&bytes)?;
-        Ok(Some(JournalWrite::Open {
-            offset_ms,
-            sealing: Box::new(Sealing {
-                seal: SignatureSet::new(seal),
-                ..Sealing::default()
+        let pro = self.container.opening_form() == ksg_core_v2::journal::Mode::Pro;
+        if !pro {
+            self.pending_open_offset = None;
+            return Ok((
+                Some(JournalWrite::Open {
+                    offset_ms,
+                    sealing: Box::new(Sealing {
+                        seal: SignatureSet::new(seal),
+                        ..Sealing::default()
+                    }),
+                }),
+                None,
+            ));
+        }
+        if self.pending_open_offset.is_none() {
+            self.pending_open_offset = Some(offset_ms);
+        }
+        // The owner's session seals at once; a client's waits for the
+        // co-seal handed in through `Sign` — the exact seal bytes, as the
+        // container checks them.
+        let owner = match self.sign_owner(&bytes) {
+            Ok(s) => s,
+            Err(missing @ Answer::NeedsSignature { .. }) => {
+                self.pending_opening = true;
+                self.pending_open_bytes = bytes;
+                return Err(missing);
+            }
+            Err(refused) => return Err(refused),
+        };
+        Ok((
+            Some(JournalWrite::Open {
+                offset_ms,
+                sealing: Box::new(Sealing {
+                    seal: SignatureSet::new(seal),
+                    owner: Some(SignatureSet::new(vec![owner])),
+                    anchor: Some(local_anchor(hash)),
+                    ..Sealing::default()
+                }),
             }),
-        }))
+            Some(AnchorNeed {
+                kind: AnchorKind::Seal,
+                prev: *self.container.id(),
+                subject: hash,
+            }),
+        ))
     }
 
     /// The other party's signature over the bytes a [`Answer::NeedsSignature`]
     /// handed out: the pending command is pressed with it (Л-1 — the
-    /// signature is made outside the module, the check is inside).
+    /// signature is made outside the module, the check is inside). An
+    /// initiation's birth and a Pro opening's co-seal never wait together: a
+    /// birth is made before the container is born, an opening after.
     fn sign_pending(&mut self, raw: &[u8]) -> Answer {
+        if self.pending_opening {
+            let signature: Signature = match serde_json::from_slice(raw) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Answer::Refused {
+                        reason: format!("the signature does not read: {e}"),
+                    }
+                }
+            };
+            self.pending_open_owner = Some(signature);
+            return match self.open_journal_after_sign() {
+                Ok(done) => {
+                    self.clear_opening();
+                    done
+                }
+                Err(still @ Answer::NeedsSignature { .. }) => still,
+                Err(refused) => {
+                    self.pending_open_owner = None;
+                    refused
+                }
+            };
+        }
         if !self.pending_birth {
             return Answer::Refused {
                 reason: "nothing waits for a signature".into(),
@@ -987,6 +1115,30 @@ impl Session {
                 self.pending_owner = None;
                 refused
             }
+        }
+    }
+
+    /// Page 0 with the owner's co-seal handed in: the press with it — `Done`,
+    /// or what the network owes instead (`NeedsAnchor`, then the reader's
+    /// `Reanchor`), as after an initiation.
+    fn open_journal_after_sign(&mut self) -> Result<Answer, Answer> {
+        match self.press(
+            Operation::OpenJournal,
+            &[Party::Client],
+            &Evidence::None,
+            PageToWrite::Opening,
+        ) {
+            Ok(()) => Ok(Answer::Done {
+                bytes: serde_json::json!({
+                    "pages": self.container.pages(),
+                    "seal": self.container.top_seal_hash().map(|h| h.to_multihash()),
+                })
+                .to_string()
+                .into_bytes(),
+            }),
+            Err(owed @ Answer::NeedsAnchor { .. }) => Ok(owed),
+            Err(still @ Answer::NeedsSignature { .. }) => Err(still),
+            Err(refused) => Err(refused),
         }
     }
 
@@ -1095,6 +1247,11 @@ impl Session {
                 return Ok(signature.clone());
             }
         }
+        if let Some(signature) = &self.pending_open_owner {
+            if msg == self.pending_open_bytes.as_slice() {
+                return Ok(signature.clone());
+            }
+        }
         match &self.owner {
             Some(signer) => Ok(signer.sign(msg)),
             None => Err(self.missing(Party::Owner, msg)),
@@ -1147,7 +1304,7 @@ impl Session {
         event.covered = event.subject();
         let covered = event.covered.clone();
         event.signatures = self.sign_all(&covered, who)?;
-        let (page, page_need) = self.page(page)?;
+        let (page, page_need) = self.opening_page_or(page)?;
         let (status, status_need) = self.status_record(op)?;
         let keys = self.container.roster().keys().clone();
         let at_ms = Some(self.clock_ms);
@@ -1180,6 +1337,19 @@ impl Session {
         Ok(())
     }
 
+    /// The page a command writes: page 0 through its own co-seal round trip,
+    /// a record through the draft's seal — and what its seal owes the
+    /// network, when it owes any.
+    fn opening_page_or(
+        &mut self,
+        spec: PageToWrite,
+    ) -> Result<(Option<JournalWrite>, Option<AnchorNeed>), Answer> {
+        match spec {
+            PageToWrite::Opening => self.opening_page(),
+            _ => self.page(spec),
+        }
+    }
+
     /// The page a command writes, sealed the way its parties do (CH-29) — and
     /// what its seal owes the network, when it owes any.
     fn page(
@@ -1188,7 +1358,11 @@ impl Session {
     ) -> Result<(Option<JournalWrite>, Option<AnchorNeed>), Answer> {
         let (kind, content) = match spec {
             PageToWrite::None => return Ok((None, None)),
-            PageToWrite::Opening => return self.opening_page().map(|w| (w, None)),
+            PageToWrite::Opening => {
+                return Err(Answer::Refused {
+                    reason: "the opening goes through its own co-seal round trip".into(),
+                })
+            }
             PageToWrite::Record(kind, content) => (kind, content),
         };
         let offset_ms = self.tick();

@@ -169,6 +169,17 @@ impl Fixture {
         f
     }
 
+        /// A heavy (Pro) container, initiated, NOT yet opened: `OpenJournal` goes
+    /// through the module's own co-seal round trip.
+    #[must_use]
+    pub fn started_heavy_unopened() -> Self {
+        let mut f = Self::printed(Class::Heavy, Parties::new(), TestRng(7));
+        f.press_packet();
+        f.press_buyer_key();
+        f.press_initiate();
+        f
+    }
+
     /// A heavy (Pro) container, initiated, with page 0 written: page 0
     /// carries the owner's seal and a placeholder anchor (CH-26), the status
     /// records their placeholder anchors.
