@@ -106,8 +106,13 @@ pub const LOCAL_ANCHOR: &str = "urn:ksg:anchor:local:v1";
 pub enum Request {
     /// E-4: the client's key is born; the maps' public halves come with it.
     ///
-    /// Stand-only path: both halves are born inside the module (demo). The
-    /// product splits the birth: `BeginBirth` / `FinishBirth`.
+    /// Stand/test-only (the all-in-one birth where one process holds both
+    /// halves for the demo or a test): `#[doc(hidden)]` because the product
+    /// wire has no `initiate` command — it splits the birth over
+    /// `BeginBirth` / `FinishBirth`. One process must never hold both halves
+    /// outside a stand or a test, so `debug_assert`s on the helpers below
+    /// pin the invariant in debug builds.
+    #[doc(hidden)]
     Initiate,
     /// E-4 split, messages 1-2: the mobile side commitment comes in, the
     /// container answer (message 2) goes out. Nothing is pressed yet.
@@ -854,14 +859,30 @@ impl Session {
 
     /// E-4: the client's key is born, and the container with it.
     ///
-    /// The birth is three messages between two sides; both run here, because
-    /// the capsule is the only place that holds the container's half and the
-    /// session may hold the other. The signature set is the client's **and**
+    /// Stand/test-only: the birth is three messages between two sides, both
+    /// run here, because the capsule is the only place that holds the
+    /// container's half and the session may hold the other. The product
+    /// splits the birth over the wire (`BeginBirth` / `FinishBirth`). Builds
+    /// have no `initiate`
+    /// command: one process must never hold both halves outside a stand or
+    /// a test, so a release binary refuses the all-in-one path at the
+    /// boundary instead of pressing it.
     /// the owner's (`Operation::Initiate`), so a session that is only the
     /// client's answers [`Answer::NeedsSignature`] with the bytes the owner
     /// signs, and keeps the birth in memory until it is pressed or the session
     /// closes (a close refuses: a birth is never stored).
+    ///
+    /// Stand/test-only: `#[doc(hidden)]` because the wire has no `initiate`
+    /// command outside the stand and tests. The `debug_assert`
+    /// below pins the invariant in debug builds: the all-in-one birth runs
+    /// where one process holds the half for the demo or a test — never in
+    /// the product, where the halves live on two sides of the wire.
+    #[doc(hidden)]
     fn initiate(&mut self) -> Answer {
+        debug_assert!(
+            self.mobile.is_none(),
+            "all-in-one birth runs on the stand or in tests: the session must hold no half yet"
+        );
         if self.container.born() {
             return Answer::Refused {
                 reason: "the container is initiated already".into(),
@@ -1156,7 +1177,12 @@ impl Session {
     /// The bookkeeping of a pressed birth: the half never leaves the
     /// module — it stays in the session, or the session forgets it at once
     /// when the owner's file is the one that pressed (the half is the
-    /// client's, not the reader's to keep).
+    /// client's, not the reader's to keep). Stand/test-only, paired with
+    /// [`Session::initiate`]: the split birth answers through
+    /// [`Session::finish_birth_done`] instead. `#[doc(hidden)]` because the
+    /// wire has no `initiate` command outside the stand and tests:
+    /// one process must never hold both halves outside a stand or a test.
+    #[doc(hidden)]
     fn birth_done(&mut self, id: Hash) -> Answer {
         let Some(mobile) = self.mobile.take() else {
             return Answer::Refused {
@@ -1540,7 +1566,11 @@ impl Session {
     }
 
     /// The client's half is here: one call opens the round, answers it, and
-    /// closes it — as on the stand.
+    /// closes it — as on the stand. Stand/test-only like [`Session::initiate`]:
+    /// the product path keeps no half inside and signs over the wire
+    /// (`NeedsClientCommit` / `NeedsShare`), so outside the stand and tests
+    /// this closes over the caller-provided half the reader holds in its own
+    /// process — never over a half that crossed into the module.
     fn sign_client_local(&mut self, msg: &[u8]) -> Result<Vec<Signature>, Answer> {
         let Some(mobile) = &self.mobile else {
             return Err(self.missing(Party::Client, msg));
