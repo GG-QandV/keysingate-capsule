@@ -21,6 +21,10 @@ zeroize.workspace = true
 # The map's public halves are rebuilt from the capsule into a `SealTo`
 # (`ksg_container_v2::layers`), and the FROST rounds take `rand_core`'s traits.
 x25519-dalek.workspace = true
+curve25519-dalek = { version = "4", default-features = false }
+hkdf.workspace = true
+sha2.workspace = true
+chacha20poly1305.workspace = true
 rand_core = { version = "0.6" }
 # Outside the capsule the operating system is the CSPRNG; inside it, the
 # reader's `ksg_host.random` is (see the wasm32 section below).

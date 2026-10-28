@@ -15,5 +15,6 @@
 //! Skeleton of 26.10; the session and the boundary landed 27.10 (plan v8, K4).
 
 pub mod abi;
+pub mod pake;
 pub mod secret;
 pub mod session;
