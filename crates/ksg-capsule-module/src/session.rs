@@ -156,6 +156,18 @@ pub enum Request {
         /// The signature's JSON.
         signature: Vec<u8>,
     },
+    /// Client round: mobile commitment comes in (stub until round state lands).
+    ClientCommit {
+        /// Mobile commitment bytes, base64url.
+        #[serde(with = "b64")]
+        commitment: Vec<u8>,
+    },
+    /// Client round: mobile share comes in (stub until round state lands).
+    ClientShare {
+        /// Mobile share bytes, base64url.
+        #[serde(with = "b64")]
+        share: Vec<u8>,
+    },
 }
 
 /// What a request answers.
@@ -203,6 +215,18 @@ pub enum Answer {
         /// What it signs — the exact bytes the container will check.
         #[serde(with = "b64")]
         bytes: Vec<u8>,
+    },
+    /// Client round: needs mobile commitment; round holds opaque round bytes.
+    NeedsClientCommit {
+        /// Opaque round bytes, base64url.
+        #[serde(with = "b64")]
+        round: Vec<u8>,
+    },
+    /// Client round: needs mobile share; round holds opaque round bytes.
+    NeedsShare {
+        /// Opaque round bytes, base64url.
+        #[serde(with = "b64")]
+        round: Vec<u8>,
     },
     /// Refused; nothing is written.
     Refused {
@@ -595,6 +619,9 @@ impl Session {
             Request::Reanchor { attestation } => self.reanchor(&attestation),
             Request::OpenJournal => self.open_journal(),
             Request::Sign { signature } => self.sign_pending(&signature),
+            Request::ClientCommit { .. } | Request::ClientShare { .. } => Answer::Refused {
+                reason: "no client round open".into(),
+            },
         }
     }
 
