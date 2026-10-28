@@ -516,10 +516,11 @@ pub fn initiate_mobile_web(
 
 /// E-4's birth with the mobile side wherever it runs.
 ///
-/// `local` is the stand path — the secret held here (the phone will hold
-/// its own over its channel, И23); `mobile` is the page wire the birth's
-/// two crossings ride when `local` is `None`. One of them carries the
-/// birth's three messages; the other rests.
+/// `local` is the stand path — the secret held here (the phone holds its
+/// own over the PAKE channel, so `initiate_mobile_web` is the page's local
+/// stand-in of exactly that); `mobile` is the page wire the birth's two
+/// crossings ride when `local` is `None`. One of them carries the birth's
+/// three messages; the other rests.
 ///
 /// A `&mut dyn Mobile` carries the page's birth: `keygen_start` opens the
 /// birth the page polls for, `keygen_finish` closes it with the container's
@@ -734,6 +735,34 @@ pub fn work(layout: &Layout, text: &str) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("the page's receipt: {e}"))
 }
 
+/// E-5 through the browser page (`--mobile-web`, И23): the half the
+/// client's file would keep lives in the page instead — a `--mobile-web`
+/// initiation writes no half — so `drive_page_until_done` turns every
+/// `NeedsClientCommit` with the page's `commit`/`respond`, and the holder
+/// says yes or no on the page, exactly as after the initiation.
+///
+/// # Errors
+///
+/// Not initiated, refused, the page refuses a round, or the capsule does
+/// not write.
+pub fn work_mobile_web(
+    layout: &Layout,
+    mobile: &mut ksg_cli_v2::web_mobile::WebMobile,
+    text: &str,
+) -> Result<serde_json::Value, String> {
+    let mut session = open(layout, Party::Client)?;
+    let cmd = Request::Work { text: text.into() };
+    let bytes = done(drive_page_until_done(
+        layout,
+        &mut session,
+        mobile,
+        &cmd,
+        40,
+    )?)?;
+    finish(layout, session)?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("the page's receipt: {e}"))
+}
+
 /// Repeats `cmd` until it presses: anchors go out through
 /// `anchor_and_reanchor`, every client round turns with the half the stand
 /// holds (`round_client`), and the owner's co-seal goes back in through
@@ -935,6 +964,37 @@ pub fn export_page(layout: &Layout, number: u64, party: Party) -> Result<Vec<u8>
         }
         Party::Owner => done(session.call(&Request::ExportPage { number })?)?,
     };
+    let outputs = finish(layout, session)?;
+    let page = outputs
+        .into_iter()
+        .find(|o| o == &bytes)
+        .ok_or("the export is not among the session's outputs")?;
+    Ok(page)
+}
+
+/// A client's export through the browser page (`--mobile-web`, И23): the
+/// round's commitment and share come from the page's `commit`/`respond`,
+/// the holder's word asked on the page — the half lives in the page, not
+/// in the client's file.
+///
+/// # Errors
+///
+/// Not initiated, refused, the page refuses a round, or the capsule does
+/// not write.
+pub fn export_page_mobile_web(
+    layout: &Layout,
+    mobile: &mut ksg_cli_v2::web_mobile::WebMobile,
+    number: u64,
+) -> Result<Vec<u8>, String> {
+    let mut session = open(layout, Party::Client)?;
+    let cmd = Request::ExportPage { number };
+    let bytes = done(drive_page_until_done(
+        layout,
+        &mut session,
+        mobile,
+        &cmd,
+        40,
+    )?)?;
     let outputs = finish(layout, session)?;
     let page = outputs
         .into_iter()

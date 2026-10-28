@@ -6,8 +6,8 @@
 //!                              (--payer KEYFILE | --service URL --holder ID) [--rpc URL]]
 //!                              [--wasm PATH]
 //! ksg-capsule --home DIR initiate [--mobile-web ADDR] [--web-root DIR]
-//! ksg-capsule --home DIR work TEXT
-//! ksg-capsule --home DIR export-page N [--by client|owner] [--out FILE]
+//! ksg-capsule --home DIR work TEXT [--mobile-web ADDR] [--web-root DIR]
+//! ksg-capsule --home DIR export-page N [--by client|owner] [--mobile-web ADDR] [--web-root DIR]
 //! ksg-capsule --home DIR keys [--out FILE]
 //! ksg-capsule --home DIR status
 //! ```
@@ -28,8 +28,8 @@ ksg-capsule --home DIR init [--class light|heavy|bare] [--emission ksg:em:test:N
                              (--payer KEYFILE | --service URL --holder ID) [--rpc URL]]
                              [--wasm PATH]
 ksg-capsule --home DIR initiate [--mobile-web ADDR] [--web-root DIR]
-ksg-capsule --home DIR work TEXT
-ksg-capsule --home DIR export-page N [--by client|owner] [--out FILE]
+ksg-capsule --home DIR work TEXT [--mobile-web ADDR] [--web-root DIR]
+ksg-capsule --home DIR export-page N [--by client|owner] [--mobile-web ADDR] [--web-root DIR]
 ksg-capsule --home DIR keys [--out FILE]
 ksg-capsule --home DIR status";
 
@@ -143,7 +143,10 @@ fn run(args: &[String]) -> Result<(), Problem> {
                 .rest
                 .get(1)
                 .ok_or_else(|| usage("work needs the text of the page"))?;
-            let value = flow::work(&layout, text)?;
+            let value = match mobile_web(&args)? {
+                None => flow::work(&layout, text)?,
+                Some(mut web) => flow::work_mobile_web(&layout, &mut web, text)?,
+            };
             println!("{value}");
             Ok(())
         }
@@ -154,12 +157,19 @@ fn run(args: &[String]) -> Result<(), Problem> {
                 .ok_or_else(|| usage("export-page needs a page number"))?
                 .parse()
                 .map_err(|_| usage("export-page: the number is not a number"))?;
-            let party = match args.get("by").unwrap_or("client") {
-                "client" => Party::Client,
-                "owner" => Party::Owner,
-                other => return Err(usage(format!("--by {other}: client or owner"))),
+            let web = mobile_web(&args)?;
+            let party = match (args.get("by").unwrap_or("client"), web.is_some()) {
+                (by, true) if by != "client" => {
+                    return Err(usage("--mobile-web only exports the client's pages"));
+                }
+                ("client", _) => Party::Client,
+                ("owner", _) => Party::Owner,
+                (other, _) => return Err(usage(format!("--by {other}: client or owner"))),
             };
-            let page = flow::export_page(&layout, number, party)?;
+            let page = match web {
+                None => flow::export_page(&layout, number, party)?,
+                Some(mut web) => flow::export_page_mobile_web(&layout, &mut web, number)?,
+            };
             let out = args
                 .get("out")
                 .map_or_else(|| layout.page(number), std::path::PathBuf::from);
