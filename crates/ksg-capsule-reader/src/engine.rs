@@ -103,12 +103,15 @@ impl Engine {
                     let end = start
                         .checked_add(len as usize)
                         .ok_or_else(|| wasmtime::Error::msg("random: a bad pointer"))?;
-                    let mut out = vec![0u8; len as usize];
-                    caller.data_mut().rng.fill_bytes(&mut out);
-                    let data = memory.data_mut(&mut caller);
-                    data.get_mut(start..end)
-                        .ok_or_else(|| wasmtime::Error::msg("random: out of the memory"))?
-                        .copy_from_slice(&out);
+                    // The range is checked against the module's own memory
+                    // (bounded by MEMORY_LIMIT) before anything is touched,
+                    // and the bytes go straight into it: the module's `len`
+                    // never sizes a host allocation.
+                    let (data, host) = memory.data_and_store_mut(&mut caller);
+                    let out = data
+                        .get_mut(start..end)
+                        .ok_or_else(|| wasmtime::Error::msg("random: out of the memory"))?;
+                    host.rng.fill_bytes(out);
                     Ok(())
                 },
             )
@@ -238,6 +241,18 @@ impl Engine {
             .read(&self.store, ptr as usize, &mut head)
             .map_err(|e| format!("the answer's length: {e}"))?;
         let len = u32::from_le_bytes(head) as usize;
+        // The length comes from the module: check that the whole answer lies
+        // inside its memory (bounded by MEMORY_LIMIT) before the host
+        // allocates a buffer of that size.
+        let end = (ptr as usize)
+            .checked_add(4)
+            .and_then(|start| start.checked_add(len))
+            .ok_or("the answer's length overflows")?;
+        if end > self.memory.data_size(&self.store) {
+            return Err(format!(
+                "the answer's length ({len} bytes) runs past the module's memory"
+            ));
+        }
         let mut body = vec![0u8; len];
         self.memory
             .read(&self.store, ptr as usize + 4, &mut body)
