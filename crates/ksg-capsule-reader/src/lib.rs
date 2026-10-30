@@ -1,5 +1,5 @@
 //! `ksg-capsule-reader` — the reader outside the capsule (`Spec_kapsula` §5,
-//! §10 п. 3, §12 Л-1).
+//! §10 item 3, §12 L-1).
 //!
 //! It holds no secret of its own. A press: the party's secret file → its slot
 //! → the code part → the module (wasmtime) → a session → the new capsule,
@@ -29,7 +29,7 @@ use std::io::Write as _;
 use std::path::Path;
 
 /// Writes the new capsule through a temporary file and a rename: a crash
-/// leaves the old capsule or the new one, never half of one (Р-6).
+/// leaves the old capsule or the new one, never half of one (R-6).
 ///
 /// # Errors
 ///

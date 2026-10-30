@@ -2,8 +2,8 @@
 //! initiate, work, export, keys, status — over a capsule and the parties' one
 //! secret file each.
 //!
-//! Every command is one session (`Spec_kapsula` §10 п. 3): open, `call`×N,
-//! close, the capsule written atomically (Р-6). Nothing but the capsule and
+//! Every command is one session (`Spec_kapsula` §10 item 3): open, `call`×N,
+//! close, the capsule written atomically (R-6). Nothing but the capsule and
 //! the side files is kept: the printing stand (`stand/`) is the issuer's, and
 //! the network's part (a Pro anchor of a page) is not here — see
 //! `scripts/demo_pro_capsule.sh` and the reader's `#[ignore]`d network test.
@@ -72,7 +72,7 @@ impl Layout {
     }
 
     /// The issuer's printing stand — not a part of the capsule, and not next
-    /// to a file that could name the container by its presence (`§12 Л-3`).
+    /// to a file that could name the container by its presence (`§12 L-3`).
     #[must_use]
     pub fn stand(&self) -> PathBuf {
         self.home.join("stand")
@@ -107,7 +107,7 @@ impl Layout {
     }
 }
 
-/// Reads the holder's map seed and scan key before initiation (К3: still
+/// Reads the holder's map seed and scan key before initiation (K3: still
 /// the stand's copy — the issuer's press. The module will born them at E-4
 /// (`BeginBirth`/`FinishBirth`); then this helper goes away and `init`
 /// writes placeholders instead).
@@ -243,7 +243,7 @@ pub fn init(layout: &Layout, print: &Print) -> Result<String, String> {
     )
     .map_err(|e| format!("parties.json: {e}"))?;
     let owner = Zeroizing::new(*owner_seed(&seeds)?);
-    // И26: the owner's scan key is born at the recipient's — its own seed
+    // I26: the owner's scan key is born at the recipient's — its own seed
     // from the process's CSPRNG at handover, never the stand's copy.
     let owner_file = SideFile::new(Role::Owner, &meta.id, owner.as_slice(), &map, &fresh_scan_seed());
     owner_file.write(&layout.owner_side())?;
@@ -380,7 +380,7 @@ fn done(answer: Answer) -> Result<Vec<u8>, String> {
     }
 }
 
-/// One round of the client's split key through the wire (И4): the stand holds
+/// One round of the client's split key through the wire (I4): the stand holds
 /// the mobile half and signs with it in this process — as the phone will over
 /// its own channel.
 ///
@@ -405,7 +405,7 @@ fn finish(layout: &Layout, session: Session) -> Result<Vec<Vec<u8>>, String> {
 /// The owner's signature over the bytes a `NeedsSignature` handed out, on
 /// the wire (the JSON of a `Signature`). The owner's half is its Ed25519
 /// seed: the reader signs with it outside the module, the module checks
-/// inside (Л-1).
+/// inside (L-1).
 fn owner_signature(layout: &Layout, bytes: &[u8]) -> Result<Vec<u8>, String> {
     let owner = SideFile::read(&layout.owner_side())?;
     if owner.role != Role::Owner {
@@ -510,7 +510,7 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
 
     // The half is the client's: the mobile side kept it, and the reader held
     // it through the birth — the client's file, or the client could never
-    // sign again. The scan key is born at the recipient's (И26): from
+    // sign again. The scan key is born at the recipient's (I26): from
     // initiation on the client's file carries its own scan seed, never the
     // stand's copy again.
     let mut file = SideFile::read(&layout.client_side())?;
@@ -717,7 +717,7 @@ fn initiate_remote_birth(
         map.insert("client".into(), serde_json::Value::String(named.into()));
     }
     finish(layout, session)?;
-    // The scan key is born at the recipient's (И26): a `--mobile-web`
+    // The scan key is born at the recipient's (I26): a `--mobile-web`
     // initiation writes no half, and the client's file keeps the half-less
     // shape — but its scan seed is its own from initiation on, never the
     // stand's copy again.
@@ -775,7 +775,7 @@ pub fn work(layout: &Layout, text: &str) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("the page's receipt: {e}"))
 }
 
-/// E-5 through the browser page (`--mobile-web`, И23): the half the
+/// E-5 through the browser page (`--mobile-web`, I23): the half the
 /// client's file would keep lives in the page instead — a `--mobile-web`
 /// initiation writes no half — so `drive_page_until_done` turns every
 /// `NeedsClientCommit` with the page's `commit`/`respond`, and the holder
@@ -1012,7 +1012,7 @@ pub fn export_page(layout: &Layout, number: u64, party: Party) -> Result<Vec<u8>
     Ok(page)
 }
 
-/// A client's export through the browser page (`--mobile-web`, И23): the
+/// A client's export through the browser page (`--mobile-web`, I23): the
 /// round's commitment and share come from the page's `commit`/`respond`,
 /// the holder's word asked on the page — the half lives in the page, not
 /// in the client's file.

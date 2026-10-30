@@ -1,5 +1,5 @@
 //! The engine that runs the capsule's module — wasmtime, outside the capsule
-//! (`Spec_kapsula` §5, §10 п. 3).
+//! (`Spec_kapsula` §5, §10 item 3).
 //!
 //! One engine is one module instance: one session. The boundary is the
 //! module's own ([`ksg_capsule_module::abi`]): `[u32 length][bytes]` answers,
@@ -16,7 +16,7 @@
 //!
 //! Fuel bounds the instructions a press may spend; a store limit bounds the
 //! memory the module may grow to. Without them a module from the capsule could
-//! loop forever or exhaust the host (Р-1: the reader runs untrusted code).
+//! loop forever or exhaust the host (R-1: the reader runs untrusted code).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -1,5 +1,5 @@
 //! A session of presses from **outside** the capsule (`Spec_kapsula` §5,
-//! §10 п. 3, §12 Л-1).
+//! §10 item 3, §12 L-1).
 //!
 //! The reader opens the party's slot and the code part, instantiates the
 //! module with [`crate::Engine`], then drives:
@@ -32,7 +32,7 @@ impl Session {
     /// Opens a capsule: its code part (through the party's map), the module,
     /// then the container through `ksg_open`.
     ///
-    /// `anchored` is what the reader read from the network (§5а) — each entry
+    /// `anchored` is what the reader read from the network (§5a) — each entry
     /// the JSON of a `ksg_core_v2::anchor::Attestation`, applied before the
     /// first command.
     ///

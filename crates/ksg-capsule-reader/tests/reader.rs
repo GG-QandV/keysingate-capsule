@@ -1,4 +1,4 @@
-//! The reader's own criteria: the atomic write (Р-6) and the side file.
+//! The reader's own criteria: the atomic write (R-6) and the side file.
 //! K4 is the module's (`ksg-capsule-module/tests/k4_imports.rs`), K5 is
 //! `tests/k5_offline.rs`.
 

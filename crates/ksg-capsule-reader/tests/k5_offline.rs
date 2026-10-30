@@ -127,7 +127,7 @@ fn k5_offline_a_printed_capsule_verifies_page_by_page() {
         class: Class::Light,
         keys,
         // The keys are the ones the reader itself wrote: the client is named
-        // by the `did:key` of its group key (Г-1).
+        // by the `did:key` of its group key (G-1).
         client_id_from_key: true,
         anchors: &anchors,
     };

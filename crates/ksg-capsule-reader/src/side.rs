@@ -1,6 +1,6 @@
 //! A party's one secret file (owner's decision 25.10 "one file"): its half of
 //! the signing key, the seed of its map, its scan key (`Spec_kapsula` §4, §11,
-//! §12 Л-4). JSON, mode `0600`, ~1 KB.
+//! §12 L-4). JSON, mode `0600`, ~1 KB.
 //!
 //! The map is kept as its 32-byte seed: both halves (X25519, ML-KEM-768) are
 //! expanded from it (`ksg_container_v2::layers::OpenWith::from_bytes`), so
