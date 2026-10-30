@@ -1,7 +1,7 @@
 //! `ksg-capsule-module` — the container's code as it lives **inside** the capsule.
 //!
 //! The reader finds its own slot and the code part, instantiates this module and
-//! drives a session (`[doc:CAPSULE-SPEC]` §10 п. 3, §12 Л-1):
+//! drives a session (`[doc:CAPSULE-SPEC]` §10 item 3, §12 L-1):
 //!
 //! | Export | What it does |
 //! |---|---|

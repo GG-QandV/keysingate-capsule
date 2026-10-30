@@ -4,7 +4,7 @@
 //! and sends the container share through [`Request::FinishBirth`] — the
 //! mobile half never enters the module.
 //!
-//! The client's signature round (track И4) is still the bridge: a correct
+//! The client's signature round (track I4) is still the bridge: a correct
 //! finish answers `NeedsClientCommit`, the commitment goes in through
 //! [`Request::ClientCommit`], back comes the round the mobile side signs
 //! (`NeedsShare`), the share goes in through [`Request::ClientShare`] — and

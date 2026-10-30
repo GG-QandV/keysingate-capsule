@@ -1,4 +1,4 @@
-//! The phone↔reader pairing (track И19-ф): SPAKE2 turns the 6 digits
+//! The phone↔reader pairing (track I19-f): SPAKE2 turns the 6 digits
 //! the holder typed into a channel key both sides compute — and a side
 //! with another code is refused at key confirmation, before any channel
 //! data flows.

@@ -1,4 +1,4 @@
-//! Criterion K4 (`Spec_kapsula` §10 п. 3): the module inside the capsule
+//! Criterion K4 (`Spec_kapsula` §10 item 3): the module inside the capsule
 //! imports **only** the reader's randomness and its clock — no files, no
 //! network, no WASI.
 //!
@@ -20,7 +20,7 @@ use wasmparser::{Parser, Payload};
 /// The module `cargo build --release` writes.
 const MODULE: &str = "target/wasm32-unknown-unknown/release/ksg_capsule_module.wasm";
 
-/// The two imports the boundary allows (`Spec_kapsula` §5, §10 п. 3).
+/// The two imports the boundary allows (`Spec_kapsula` §5, §10 item 3).
 const ALLOWED: [(&str, &str); 2] = [("ksg_host", "random"), ("ksg_host", "now_ms")];
 
 #[test]

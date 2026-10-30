@@ -1,4 +1,4 @@
-//! The client signing round across the wire (track И4): with no half
+//! The client signing round across the wire (track I4): with no half
 //! inside, every client signature spans `NeedsClientCommit` / `ClientCommit`
 //! / `NeedsShare` / `ClientShare` — one round per message — and the command
 //! repeated picks the closed rounds up until `Done`.
@@ -197,7 +197,7 @@ fn wire_born() -> WireBorn {
     }
     assert!(done, "the press went to done, last: {last}, seen: {seen:?}");
     // The birth pressed the initiation; the journal opens next (page 0),
-    // as on the stand — through the same wire round (И4г).
+    // as on the stand — through the same wire round (I4g).
     drive_opening(&mut session, &half, &mut rng);
     WireBorn {
         stand,

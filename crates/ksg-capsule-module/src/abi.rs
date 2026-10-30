@@ -1,7 +1,7 @@
 //! The module's boundary: exports and the two host imports. The only place
 //! `unsafe` is allowed in this crate (raw memory shared with the reader).
 //!
-//! # The wire (`Spec_kapsula` §10 п. 3, §12 Л-1)
+//! # The wire (`Spec_kapsula` §10 item 3, §12 L-1)
 //!
 //! One module instance is one instance of a **session**:
 //!

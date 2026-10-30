@@ -21,7 +21,7 @@ zeroize.workspace = true
 # The map's public halves are rebuilt from the capsule into a `SealTo`
 # (`ksg_container_v2::layers`), and the FROST rounds take `rand_core`'s traits.
 x25519-dalek.workspace = true
-# The phone↔reader pairing is SPAKE2 (И19-ф1): no unauthenticated DH.
+# The phone↔reader pairing is SPAKE2 (I19-f1): no unauthenticated DH.
 spake2 = { version = "0.4", default-features = false, features = ["std"] }
 hmac = "0.12"
 subtle = "2"

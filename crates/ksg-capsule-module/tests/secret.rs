@@ -1,4 +1,4 @@
-//! The session's secret bytes, behind named types (track И9): [`StateKey`]
+//! The session's secret bytes, behind named types (track I9): [`StateKey`]
 //! guards the 32-byte state key, [`OwnerKey`] guards the owner's signing
 //! key — and both keep their bytes out of `Debug` and wipe them when they
 //! drop.

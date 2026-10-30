@@ -1,4 +1,4 @@
-//! The phone↔reader channel: SPAKE2 PAKE by a 6-digit code, then AEAD (И19).
+//! The phone↔reader channel: SPAKE2 PAKE by a 6-digit code, then AEAD (I19).
 //!
 //! The birth of the client's key is split across two devices — the phone
 //! holds one half, the capsule's reader the other. Before the halves may

@@ -1,4 +1,4 @@
-//! The session natively (`Spec_kapsula` §10 п. 3): open the capsule, drive a
+//! The session natively (`Spec_kapsula` §10 item 3): open the capsule, drive a
 //! command, close, open again — the work is still there.
 //!
 //! The container is a real one of the light class, initiated and with its
