@@ -226,7 +226,23 @@ impl Fixture {
         f
     }
 
+    /// A light container, initiated, page 0 written, with the issuer's seal
+    /// laid at printing: the form may go to Pro (E-10 asks the seal).
+    #[must_use]
+    pub fn started_sealed() -> Self {
+        let mut f = Self::printed_with(Class::Light, Parties::new(), TestRng(7), true);
+        f.press_packet();
+        f.press_buyer_key();
+        f.press_initiate();
+        f.press_opening();
+        f
+    }
+
     fn printed(class: Class, parties: Parties, rng: TestRng) -> Self {
+        Self::printed_with(class, parties, rng, false)
+    }
+
+    fn printed_with(class: Class, parties: Parties, rng: TestRng, sealed: bool) -> Self {
         let mut rng = rng;
         let (inside, mobile) = split(client_kid(), &mut rng).expect("the client's key splits");
         let client = inside.public().clone();
@@ -287,6 +303,14 @@ impl Fixture {
             roster,
         )
         .with_pq_key(pq);
+        if sealed {
+            container = container.with_seal(ksg_container_v2::seal::IssuerSeal::lay(
+                &template,
+                uri("did:key:zSeal#s1"),
+                [90u8; 32],
+                &parties.issuer,
+            ));
+        }
         container
             .integrate_client_key(inside)
             .expect("the container's half");

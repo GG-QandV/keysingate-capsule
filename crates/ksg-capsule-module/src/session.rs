@@ -74,7 +74,7 @@ use ksg_container_v2::capsule::{self, MapPub, MapRole, Part, PartKind, Shared};
 use ksg_container_v2::client_key::{
     share_commitment, Commitment, MobileHalf, MobileShare, SigningRound,
 };
-use ksg_container_v2::container::{Container, Evidence, JournalWrite, Writes};
+use ksg_container_v2::container::{Container, Evidence, JournalWrite, UnloadRoute, Writes};
 use ksg_container_v2::layers::{OpenWith, SealTo, MLKEM_EK_LEN};
 use ksg_container_v2::{Event, Operation, Role, Where, Work, Wrapped};
 use ksg_core_v2::anchor::Attestation;
@@ -82,7 +82,7 @@ use ksg_core_v2::canonical::canonical_bytes;
 use ksg_core_v2::crypto::hash::Hash;
 use ksg_core_v2::crypto::sign::{Ed25519Signer, Profile, PublicKey, Signature, SignatureSet};
 use ksg_core_v2::doc::{Timestamp, Uri};
-use ksg_core_v2::journal::{Draft, Piece, RecordKind, RecordMeta, Sealing};
+use ksg_core_v2::journal::{Draft, Mode, Piece, RecordKind, RecordMeta, Sealing};
 use ksg_core_v2::section::StatusRecord;
 use ksg_core_v2::status::{transition_for, Outcome};
 use rand_core::{CryptoRng, RngCore};
@@ -166,6 +166,27 @@ pub enum Request {
     SetMaps {
         /// The client's map and the owner's, as the shared secrets spell them.
         maps: Vec<capsule::MapPub>,
+    },
+    /// E-10 (`Spec_kapsula` §24): the form changes — to Pro with the owner
+    /// and the issuer, back to light with the owner alone; the journal takes
+    /// a page of it.
+    Form {
+        /// The form after it.
+        to: Mode,
+    },
+    /// The owner and the client export everything; the container dies
+    /// (`FullExport`). The export goes to the session's outputs.
+    FullExport,
+    /// E-15: the client's key is lost; the owner declares the container dead.
+    DeclareKeyLost,
+    /// E-23: the issuer freezes the container on the owner's application —
+    /// the issuer's signature comes from outside (§20).
+    Freeze,
+    /// E-24: the owner declares the shares of the split key lost; the
+    /// container records the declaration's digest and goes on working.
+    DeclareSharesLost {
+        /// The declaration's digest.
+        hash: Hash,
     },
     /// The other party's signature over exactly the bytes a
     /// [`Answer::NeedsSignature`] handed out (L-1: signatures are the
@@ -405,6 +426,8 @@ enum PageToWrite {
     Opening,
     /// A record of this kind, with this content.
     Record(RecordKind, Piece),
+    /// The page of a change of form (E-10, CH-30).
+    Form(Mode),
 }
 
 /// What a repeated command still owes the press (I6b): the offsets its
@@ -476,6 +499,12 @@ pub struct Session {
     awaiting_external: Option<(Role, Vec<u8>)>,
     /// The other party's private parts, sealed (slot format v2, §21).
     carried: Vec<capsule::Carried>,
+    /// The owner's signatures handed in to a client's session by
+    /// [`Request::Sign`] for a holder's operation (`Request::Form`, …): over
+    /// which bytes, the signature.
+    owner_sigs: Vec<(Vec<u8>, Signature)>,
+    /// The owner's signature the last holder's operation asked for, if any.
+    awaiting_owner: Option<Vec<u8>>,
     /// Page 0 waiting for the owner's co-seal in Pro (CH-26): a client's
     /// session cannot seal the opening alone, so [`Request::OpenJournal`]
     /// answers [`Answer::NeedsSignature`] and the owner's [`Request::Sign`]
@@ -640,6 +669,8 @@ impl Session {
             external: Vec::new(),
             awaiting_external: None,
             carried,
+            owner_sigs: Vec::new(),
+            awaiting_owner: None,
             pending_opening: false,
             pending_open_bytes: Vec::new(),
             pending_open_offset: None,
@@ -691,6 +722,31 @@ impl Session {
             Request::OpenJournal => self.open_journal(),
             Request::ApplyPacket => self.apply_packet(),
             Request::SetMaps { maps } => self.set_maps(&maps),
+            Request::Form { to } => self.form(to),
+            Request::FullExport => self.full_export(),
+            Request::DeclareKeyLost => self.holder_op(
+                Operation::DeclareKeyLost,
+                &[Party::Owner],
+                &Evidence::None,
+                PageToWrite::None,
+            ),
+            Request::Freeze => self.holder_op(
+                Operation::FreezeOnOwnerApplication,
+                &[Party::External(Role::Issuer), Party::Owner],
+                &Evidence::None,
+                PageToWrite::None,
+            ),
+            Request::DeclareSharesLost { hash } => self.holder_op(
+                Operation::DeclareSharesLost,
+                &[Party::Owner],
+                &Evidence::SharesLost(hash),
+                // The declaration's digest is the page: the container records
+                // that it was made, not the shares (CT-22).
+                PageToWrite::Record(
+                    RecordKind::SharesDeclaredLost,
+                    Piece::Inline(hash.to_multihash().into_bytes()),
+                ),
+            ),
             Request::Sign { signature } => self.sign_pending(&signature),
             Request::ClientCommit { commitment } => self.client_commit(&commitment),
             Request::ClientShare { share } => self.client_share(&share),
@@ -1419,6 +1475,21 @@ impl Session {
                 },
             };
         }
+        // The owner's signature for a holder's operation in a client's
+        // session: kept for the repeat, as the non-holder's above.
+        if let Some(bytes) = self.awaiting_owner.take() {
+            return match serde_json::from_slice::<Signature>(raw) {
+                Ok(signature) => {
+                    self.owner_sigs.push((bytes, signature));
+                    Answer::Done {
+                        bytes: br#"{"signed":true,"repeat":"the same request"}"#.to_vec(),
+                    }
+                }
+                Err(e) => Answer::Refused {
+                    reason: format!("the signature does not read: {e}"),
+                },
+            };
+        }
         if self.pending_opening {
             let signature: Signature = match serde_json::from_slice(raw) {
                 Ok(s) => s,
@@ -1768,6 +1839,9 @@ impl Session {
                 return Ok(signature.clone());
             }
         }
+        if let Some((_, signature)) = self.owner_sigs.iter().find(|(b, _)| b.as_slice() == msg) {
+            return Ok(signature.clone());
+        }
         match &self.owner {
             Some(key) => Ok(key.signer().sign(msg)),
             None => Err(self.missing(Party::Owner, msg)),
@@ -1826,6 +1900,112 @@ impl Session {
         }
         self.maps = parsed;
         Answer::Done { bytes: br#"{"maps":["client","owner"]}"#.to_vec() }
+    }
+
+    /// The operations only a holder presses on a born container
+    /// (`Spec_kapsula` §24): E-15, E-23, E-24. A signature of the owner that
+    /// this session does not hold is asked for and handed in by
+    /// [`Request::Sign`]; the container refuses what its status does not admit.
+    fn holder_op(
+        &mut self,
+        op: Operation,
+        who: &[Party],
+        evidence: &Evidence,
+        page: PageToWrite,
+    ) -> Answer {
+        self.awaiting_owner = None;
+        match self.press(op, who, evidence, page) {
+            Ok(()) => Answer::Done {
+                bytes: self.status_json().to_string().into_bytes(),
+            },
+            Err(answer) => self.note_owner_wait(answer),
+        }
+    }
+
+    /// E-10 through the session: the form changes, the journal takes a page of
+    /// it. Pro (up) takes the issuer beside the owner, light (down) the owner
+    /// alone.
+    fn form(&mut self, to: Mode) -> Answer {
+        self.awaiting_owner = None;
+        let who: &[Party] = match to {
+            Mode::Pro => &[Party::Owner, Party::External(Role::Issuer)],
+            Mode::Local => &[Party::Owner],
+        };
+        match self.press(
+            Operation::RaiseClass,
+            who,
+            &Evidence::Form { to },
+            PageToWrite::Form(to),
+        ) {
+            Ok(()) => Answer::Done {
+                bytes: self.status_json().to_string().into_bytes(),
+            },
+            Err(answer) => self.note_owner_wait(answer),
+        }
+    }
+
+    /// `FullExport`: the owner and the client export everything and the
+    /// container dies. The export goes to `outputs`, as a page does.
+    fn full_export(&mut self) -> Answer {
+        self.awaiting_owner = None;
+        if let Err(answer) = self.press(
+            Operation::FullExport,
+            &[Party::Owner, Party::Client],
+            &Evidence::Unload(Box::new(UnloadRoute::Principals)),
+            PageToWrite::None,
+        ) {
+            return self.note_owner_wait(answer);
+        }
+        let Some(export) = self.container.take_export() else {
+            return Answer::Refused {
+                reason: "no export handed out".into(),
+            };
+        };
+        match serde_json::to_vec(&export) {
+            Ok(bytes) => {
+                self.outputs.push(bytes.clone());
+                Answer::Done { bytes }
+            }
+            Err(e) => Answer::Refused {
+                reason: format!("the export does not serialize: {e}"),
+            },
+        }
+    }
+
+    /// Remembers the bytes of an owner's signature a client's session waits
+    /// for, so [`Request::Sign`] can take it.
+    fn note_owner_wait(&mut self, answer: Answer) -> Answer {
+        if let Answer::NeedsSignature { party, bytes } = &answer {
+            if party == Party::Owner.name() && self.owner.is_none() {
+                self.awaiting_owner = Some(bytes.clone());
+            }
+        }
+        answer
+    }
+
+    /// The page of a change of form, sealed the way its parties do (CH-29).
+    fn form_page(
+        &mut self,
+        to: Mode,
+    ) -> Result<(Option<JournalWrite>, Option<AnchorNeed>), Answer> {
+        let offset_ms = match self.press_offsets.page_offsets.pop() {
+            Some(ticked) => {
+                self.press_offsets.page_offsets.push(ticked);
+                ticked
+            }
+            None => {
+                let ticked = self.tick();
+                self.press_offsets.page_offsets.push(ticked);
+                ticked
+            }
+        };
+        let draft = self
+            .container
+            .draft_form(to, offset_ms)
+            .map_err(|e| Answer::Refused {
+                reason: format!("the page is not drafted: {e}"),
+            })?;
+        self.seal_draft(draft).map(|(w, n)| (Some(w), n))
     }
 
     /// "This party's signature is needed over exactly these bytes."
@@ -1983,6 +2163,7 @@ impl Session {
                 })
             }
             PageToWrite::Record(kind, content) => (kind, content),
+            PageToWrite::Form(to) => return self.form_page(to),
         };
         // A repeated command reuses the offsets its open press ticked (I6b):
         // the draft — and the seal bytes the wire round signs — stays the
