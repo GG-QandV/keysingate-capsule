@@ -202,6 +202,13 @@ impl Fixture {
         Self::printed_unborn(Class::Light, Parties::new(), TestRng(7))
     }
 
+    /// A signature by a key nobody seated (the buyer's, never asked for
+    /// the packet) — what a wrong signer hands in.
+    #[must_use]
+    pub fn stranger_signs(&self, msg: &[u8]) -> ksg_core_v2::crypto::sign::Signature {
+        self.parties.buyer.sign(msg)
+    }
+
     /// The issuer's signature over `msg` — what the reader hands in when the
     /// capsule answers `NeedsSignature {party: "issuer"}`.
     #[must_use]

@@ -2054,7 +2054,13 @@ impl Session {
         // when the half is outside (I4g: no half inside, the status move
         // answers `NeedsClientCommit` like `Work`); the owner's session
         // with its key, as before.
-        record.signatures = if self.mobile.is_some() || self.owner.is_none() {
+        // Before initiation the status records are the issuer's word (the
+        // sale — E-2, E-3; `Spec_kapsula` §19): the issuer holds no map, so
+        // its signature comes from outside (§20). The initiation's own record
+        // is signed as before.
+        record.signatures = if !self.container.born() && op != Operation::Initiate {
+            SignatureSet::new(vec![self.sign_external(&bytes, Role::Issuer)?])
+        } else if self.mobile.is_some() || self.owner.is_none() {
             SignatureSet::new(self.sign_client(&bytes)?)
         } else {
             SignatureSet::new(vec![self.sign_owner(&bytes)?])
