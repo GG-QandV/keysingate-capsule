@@ -195,6 +195,20 @@ impl Fixture {
         f
     }
 
+    /// Printed only (status 0): no packet, no buyer's key — the sale is
+    /// pressed through the session (`Spec_kapsula` §19).
+    #[must_use]
+    pub fn printed_only() -> Self {
+        Self::printed_unborn(Class::Light, Parties::new(), TestRng(7))
+    }
+
+    /// The issuer's signature over `msg` — what the reader hands in when the
+    /// capsule answers `NeedsSignature {party: "issuer"}`.
+    #[must_use]
+    pub fn issuer_signs(&self, msg: &[u8]) -> ksg_core_v2::crypto::sign::Signature {
+        self.parties.issuer.sign(msg)
+    }
+
     #[must_use]
     pub fn started_heavy() -> Self {
         let mut f = Self::printed(Class::Heavy, Parties::new(), TestRng(7));

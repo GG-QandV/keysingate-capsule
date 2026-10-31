@@ -155,6 +155,11 @@ pub enum Request {
     },
     /// E-5: the journal is open — page 0, sealed by the client's two halves.
     OpenJournal,
+    /// E-2: the packet, pressed by the issuer through the holder's map before
+    /// initiation (`Spec_kapsula` §19). The issuer's signature comes from
+    /// outside: [`Answer::NeedsSignature`] `{party: "issuer"}`, then
+    /// [`Request::Sign`], then this request again.
+    ApplyPacket,
     /// The other party's signature over exactly the bytes a
     /// [`Answer::NeedsSignature`] handed out (L-1: signatures are the
     /// reader's work). The JSON of a `ksg_core_v2::crypto::sign::Signature`;
@@ -457,6 +462,11 @@ pub struct Session {
     /// The other party's signature over [`Session::pending_bytes`], handed in
     /// by [`Request::Sign`] while a birth waits for it.
     pending_owner: Option<Signature>,
+    /// Signatures of parties that hold no map (`Spec_kapsula` §20), handed in
+    /// by [`Request::Sign`]: who, over which bytes, the signature.
+    external: Vec<(Role, Vec<u8>, Signature)>,
+    /// The non-holder signature the last press asked for, if any.
+    awaiting_external: Option<(Role, Vec<u8>)>,
     /// Page 0 waiting for the owner's co-seal in Pro (CH-26): a client's
     /// session cannot seal the opening alone, so [`Request::OpenJournal`]
     /// answers [`Answer::NeedsSignature`] and the owner's [`Request::Sign`]
@@ -616,6 +626,8 @@ impl Session {
             pending_birth: false,
             pending_bytes: Vec::new(),
             pending_owner: None,
+            external: Vec::new(),
+            awaiting_external: None,
             pending_opening: false,
             pending_open_bytes: Vec::new(),
             pending_open_offset: None,
@@ -665,6 +677,7 @@ impl Session {
             Request::FinishBirth { fin, group_key } => self.finish_birth_request(&fin, group_key),
             Request::Reanchor { attestation } => self.reanchor(&attestation),
             Request::OpenJournal => self.open_journal(),
+            Request::ApplyPacket => self.apply_packet(),
             Request::Sign { signature } => self.sign_pending(&signature),
             Request::ClientCommit { commitment } => self.client_commit(&commitment),
             Request::ClientShare { share } => self.client_share(&share),
@@ -1365,6 +1378,22 @@ impl Session {
     /// initiation's birth and a Pro opening's co-seal never wait together: a
     /// birth is made before the container is born, an opening after.
     fn sign_pending(&mut self, raw: &[u8]) -> Answer {
+        // A non-holder's signature (§20): kept for the repeat of the command
+        // that asked for it — the press stays open, so the repeat signs the
+        // same bytes (I6b) and finds it.
+        if let Some((role, bytes)) = self.awaiting_external.take() {
+            return match serde_json::from_slice::<Signature>(raw) {
+                Ok(signature) => {
+                    self.external.push((role, bytes, signature));
+                    Answer::Done {
+                        bytes: br#"{"signed":true,"repeat":"the same request"}"#.to_vec(),
+                    }
+                }
+                Err(e) => Answer::Refused {
+                    reason: format!("the signature does not read: {e}"),
+                },
+            };
+        }
         if self.pending_opening {
             let signature: Signature = match serde_json::from_slice(raw) {
                 Ok(s) => s,
@@ -1720,6 +1749,39 @@ impl Session {
         }
     }
 
+    /// A party that holds no map signs outside (§20): the signature handed in
+    /// for exactly these bytes, or the question for it.
+    fn sign_external(&mut self, msg: &[u8], role: Role) -> Result<Signature, Answer> {
+        if let Some((_, _, signature)) =
+            self.external.iter().find(|(r, b, _)| *r == role && b.as_slice() == msg)
+        {
+            return Ok(signature.clone());
+        }
+        self.awaiting_external = Some((role, msg.to_vec()));
+        Err(self.missing(Party::External(role), msg))
+    }
+
+    /// E-2 through the session (§19): the issuer's press on the holder's map,
+    /// before initiation; `bare` has no packet.
+    fn apply_packet(&mut self) -> Answer {
+        if self.container.born() {
+            return Answer::Refused {
+                reason: "the container is initiated: the packet is before E-4".into(),
+            };
+        }
+        match self.press(
+            Operation::ApplyPacket,
+            &[Party::External(Role::Issuer)],
+            &Evidence::None,
+            PageToWrite::None,
+        ) {
+            Ok(()) => Answer::Done {
+                bytes: self.status_json().to_string().into_bytes(),
+            },
+            Err(answer) => answer,
+        }
+    }
+
     /// "This party's signature is needed over exactly these bytes."
     fn missing(&self, party: Party, bytes: &[u8]) -> Answer {
         Answer::NeedsSignature {
@@ -1735,6 +1797,7 @@ impl Session {
             match party {
                 Party::Client => sigs.extend(self.sign_client(msg)?),
                 Party::Owner => sigs.push(self.sign_owner(msg)?),
+                Party::External(role) => sigs.push(self.sign_external(msg, *role)?),
             }
         }
         Ok(SignatureSet::new(sigs))
@@ -2080,6 +2143,10 @@ enum Party {
     Client,
     /// The owner-holder, with its own key.
     Owner,
+    /// A party that holds no map — the issuer, an arbiter, the former
+    /// client, a sub-agent (`Spec_kapsula` §20): its signature comes from
+    /// outside through [`Answer::NeedsSignature`] and [`Request::Sign`].
+    External(Role),
 }
 
 impl Party {
@@ -2088,6 +2155,18 @@ impl Party {
         match self {
             Self::Client => "client",
             Self::Owner => "owner",
+            Self::External(role) => match role {
+                Role::Issuer => "issuer",
+                Role::Owner => "owner",
+                Role::Client => "client",
+                Role::SubAgent => "sub-agent",
+                Role::Buyer => "buyer",
+                Role::Orchestrator => "orchestrator",
+                Role::Arbiter => "arbiter",
+                Role::Claimant => "claimant",
+                Role::Distributor => "distributor",
+                Role::FormerClient => "former-client",
+            },
         }
     }
 }
