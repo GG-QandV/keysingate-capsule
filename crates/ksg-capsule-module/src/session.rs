@@ -160,6 +160,13 @@ pub enum Request {
     /// outside: [`Answer::NeedsSignature`] `{party: "issuer"}`, then
     /// [`Request::Sign`], then this request again.
     ApplyPacket,
+    /// E-4 done (§21, 4б.4а): the holder's map gives way to the client's and
+    /// the owner's — each born at its party's, only the public halves come
+    /// in. Once, after the initiation, while the capsule has one map.
+    SetMaps {
+        /// The client's map and the owner's, as the shared secrets spell them.
+        maps: Vec<capsule::MapPub>,
+    },
     /// The other party's signature over exactly the bytes a
     /// [`Answer::NeedsSignature`] handed out (L-1: signatures are the
     /// reader's work). The JSON of a `ksg_core_v2::crypto::sign::Signature`;
@@ -467,6 +474,8 @@ pub struct Session {
     external: Vec<(Role, Vec<u8>, Signature)>,
     /// The non-holder signature the last press asked for, if any.
     awaiting_external: Option<(Role, Vec<u8>)>,
+    /// The other party's private parts, sealed (slot format v2, §21).
+    carried: Vec<capsule::Carried>,
     /// Page 0 waiting for the owner's co-seal in Pro (CH-26): a client's
     /// session cannot seal the opening alone, so [`Request::OpenJournal`]
     /// answers [`Answer::NeedsSignature`] and the owner's [`Request::Sign`]
@@ -534,8 +543,10 @@ impl Session {
             return Err(format!("side file: version {} is not 1", side.v));
         }
         let map = OpenWith::from_bytes(decode_32(&side.map, "side file: map")?);
-        let (slot_role, opened) =
-            capsule::open(capsule_bytes, &map).map_err(|e| format!("capsule: {e}"))?;
+        // Slot format v2 (§21): the other party's private part comes back
+        // sealed, to be carried into the next assembly unopened.
+        let split = capsule::open_split(capsule_bytes, &map).map_err(|e| format!("capsule: {e}"))?;
+        let (slot_role, opened, carried) = (split.role, split.parts, split.carried);
         if !slot_matches(slot_role, side.role) {
             return Err(format!(
                 "the side file is the {}'s, the slot is the {}'s: not this party's capsule",
@@ -628,6 +639,7 @@ impl Session {
             pending_owner: None,
             external: Vec::new(),
             awaiting_external: None,
+            carried,
             pending_opening: false,
             pending_open_bytes: Vec::new(),
             pending_open_offset: None,
@@ -678,6 +690,7 @@ impl Session {
             Request::Reanchor { attestation } => self.reanchor(&attestation),
             Request::OpenJournal => self.open_journal(),
             Request::ApplyPacket => self.apply_packet(),
+            Request::SetMaps { maps } => self.set_maps(&maps),
             Request::Sign { signature } => self.sign_pending(&signature),
             Request::ClientCommit { commitment } => self.client_commit(&commitment),
             Request::ClientShare { share } => self.client_share(&share),
@@ -729,20 +742,32 @@ impl Session {
                 owed.subject.to_multihash(),
             ));
         }
-        if self.maps.len() > 1 {
-            return Err(
-                "the capsule seals to more than one map: the parts this map does not open (the \
-                 other party's secrets) cannot be carried through re-assembly, and losing them \
-                 silently is worse than refusing"
-                    .into(),
-            );
-        }
         let mut rng = CspRng;
         let state = self
             .container
             .seal_to_bytes(self.state_key.bytes(), &mut rng)
             .map_err(|e| format!("the state does not seal: {e}"))?;
         let mut fill = |out: &mut [u8]| rng.fill_bytes(out);
+        // Two maps (§21, 4б.4а): v2 — the other party's private part rides
+        // through unopened. One map: as before.
+        if self.maps.len() > 1 {
+            let capsule = capsule::seal_into_capsule_split(
+                &state,
+                self.state_key.bytes(),
+                &self.template.to_multihash(),
+                self.artifact.as_str(),
+                self.client_kid.as_str(),
+                self.issued_ms,
+                self.clock_ms,
+                &self.code,
+                &self.parts,
+                &self.carried,
+                &self.maps,
+                &mut fill,
+            )
+            .map_err(|e| format!("the capsule does not assemble: {e}"))?;
+            return Ok((capsule, self.outputs.clone()));
+        }
         let capsule = seal_parts(
             &state,
             &self.state_key,
@@ -1780,6 +1805,27 @@ impl Session {
             },
             Err(answer) => answer,
         }
+    }
+
+    /// The client's and the owner's maps replace the holder's (§21).
+    fn set_maps(&mut self, maps: &[capsule::MapPub]) -> Answer {
+        if !self.container.born() {
+            return Answer::Refused { reason: "the maps are set after the initiation (E-4)".into() };
+        }
+        if self.maps.len() != 1 || self.maps[0].0 != MapRole::Holder {
+            return Answer::Refused { reason: "the capsule already carries the parties' maps".into() };
+        }
+        let parsed: Result<Vec<(MapRole, SealTo)>, String> = maps.iter().map(map_from).collect();
+        let parsed = match parsed {
+            Ok(p) => p,
+            Err(reason) => return Answer::Refused { reason },
+        };
+        let roles: Vec<MapRole> = parsed.iter().map(|(r, _)| *r).collect();
+        if roles != [MapRole::Client, MapRole::Owner] {
+            return Answer::Refused { reason: "the maps are the client's and the owner's, in that order".into() };
+        }
+        self.maps = parsed;
+        Answer::Done { bytes: br#"{"maps":["client","owner"]}"#.to_vec() }
     }
 
     /// "This party's signature is needed over exactly these bytes."

@@ -23,10 +23,12 @@ use ksg_core_v2::crypto::hash::Hash;
 use ksg_core_v2::crypto::sign::Ed25519Signer;
 use ksg_core_v2::doc::{Class, Uri};
 use ksg_verify_v2::solana::{HttpRpc, SealScanKey};
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore as _};
 use zeroize::Zeroizing;
 
 use crate::session::Session;
+use ksg_container_v2::capsule::MapPub;
+use ksg_container_v2::layers::OpenWith;
 use crate::side::{Role, SideFile};
 use crate::write_capsule;
 
@@ -506,6 +508,7 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
     if let Some(map) = value.as_object_mut() {
         map.insert("journal".into(), opening);
     }
+    let maps = split_maps(&mut session)?;
     finish(layout, session)?;
 
     // The half is the client's: the mobile side kept it, and the reader held
@@ -521,6 +524,7 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
     );
     file.scan = B64.encode(fresh_scan_seed());
     file.write(&layout.client_side())?;
+    write_maps(layout, &maps)?;
     Ok(value)
 }
 
@@ -716,6 +720,7 @@ fn initiate_remote_birth(
     if let Some(map) = value.as_object_mut() {
         map.insert("client".into(), serde_json::Value::String(named.into()));
     }
+    let maps = split_maps(&mut session)?;
     finish(layout, session)?;
     // The scan key is born at the recipient's (I26): a `--mobile-web`
     // initiation writes no half, and the client's file keeps the half-less
@@ -724,6 +729,7 @@ fn initiate_remote_birth(
     let mut file = SideFile::read(&layout.client_side())?;
     file.scan = B64.encode(fresh_scan_seed());
     file.write(&layout.client_side())?;
+    write_maps(layout, &maps)?;
     Ok(value)
 }
 
@@ -1065,4 +1071,40 @@ pub fn status(layout: &Layout) -> Result<serde_json::Value, String> {
     let bytes = done(session.call(&Request::Status)?)?;
     finish(layout, session)?;
     serde_json::from_slice(&bytes).map_err(|e| format!("the status: {e}"))
+}
+
+/// Two maps after E-4 (`Spec_kapsula` §21, 4б.4а): each party's map is born
+/// here, at the reader that writes that party's file; the module gets the
+/// public halves only and seals the next capsule to them.
+/// The client's map seed and the owner's.
+type MapSeeds = (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>);
+
+fn split_maps(session: &mut Session) -> Result<MapSeeds, String> {
+    let mut client = Zeroizing::new([0u8; 32]);
+    let mut owner = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(client.as_mut());
+    OsRng.fill_bytes(owner.as_mut());
+    let public = |role: &str, seed: &[u8; 32]| {
+        let to = OpenWith::from_bytes(*seed).seal_to();
+        MapPub {
+            role: role.into(),
+            x25519: B64.encode(to.public().as_bytes()),
+            mlkem: B64.encode(to.mlkem()),
+        }
+    };
+    let maps = vec![public("client", &client), public("owner", &owner)];
+    done(session.call(&Request::SetMaps { maps })?)?;
+    Ok((client, owner))
+}
+
+/// Each party's file gets its own map seed — the holder's map (the issuer's
+/// stand knows it) opens nothing from here on.
+fn write_maps(layout: &Layout, maps: &MapSeeds) -> Result<(), String> {
+    let mut client = SideFile::read(&layout.client_side())?;
+    client.map = B64.encode(maps.0.as_slice());
+    client.write(&layout.client_side())?;
+    let mut owner = SideFile::read(&layout.owner_side())?;
+    owner.map = B64.encode(maps.1.as_slice());
+    owner.write(&layout.owner_side())?;
+    Ok(())
 }
