@@ -10,7 +10,12 @@
 //! ksg-capsule --home DIR export-page N [--by client|owner] [--mobile-web ADDR] [--web-root DIR]
 //! ksg-capsule --home DIR keys [--out FILE]
 //! ksg-capsule --home DIR status
+//! ksg-capsule --home DIR backup --party client|owner --out FILE
+//! ksg-capsule --home DIR restore --party client|owner --from FILE
 //! ```
+//!
+//! `backup` and `restore` take the password only from the file named by the
+//! environment variable `KSG_BACKUP_PASSWORD_FILE`.
 //!
 //! Every command after `init` is one session over the capsule and a party's
 //! one secret file: open → call → close → the capsule written atomically.
@@ -31,7 +36,10 @@ ksg-capsule --home DIR initiate [--mobile-web ADDR] [--web-root DIR]
 ksg-capsule --home DIR work TEXT [--mobile-web ADDR] [--web-root DIR]
 ksg-capsule --home DIR export-page N [--by client|owner] [--mobile-web ADDR] [--web-root DIR]
 ksg-capsule --home DIR keys [--out FILE]
-ksg-capsule --home DIR status";
+ksg-capsule --home DIR status
+ksg-capsule --home DIR backup --party client|owner --out FILE
+ksg-capsule --home DIR restore --party client|owner --from FILE
+  (the password: the file named by KSG_BACKUP_PASSWORD_FILE, never an argument)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -191,7 +199,30 @@ fn run(args: &[String]) -> Result<(), Problem> {
             println!("{status}");
             Ok(())
         }
+        "backup" => {
+            let party = party_flag(&args)?;
+            let out = args.get("out").ok_or_else(|| usage("backup needs --out FILE"))?;
+            flow::backup(&layout, party, std::path::Path::new(out))?;
+            println!("{out}");
+            Ok(())
+        }
+        "restore" => {
+            let party = party_flag(&args)?;
+            let from = args.get("from").ok_or_else(|| usage("restore needs --from FILE"))?;
+            flow::restore(&layout, party, std::path::Path::new(from))?;
+            println!("{}", layout.side(party).display());
+            Ok(())
+        }
         other => Err(usage(format!("no command {other:?}"))),
+    }
+}
+
+/// `--party client|owner`.
+fn party_flag(args: &Args) -> Result<Party, Problem> {
+    match args.get("party") {
+        Some("client") => Ok(Party::Client),
+        Some("owner") => Ok(Party::Owner),
+        _ => Err(usage("--party client|owner is required")),
     }
 }
 

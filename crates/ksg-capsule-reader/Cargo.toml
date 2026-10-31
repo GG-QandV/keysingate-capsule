@@ -23,6 +23,9 @@ ksg-capsule-module = { path = "../ksg-capsule-module" }
 # The stand's print (`init`) and the owner's file: the capsule is the same
 # container, printed by the issuer's desk.
 ksg-cli-v2 = { path = "../ksg-cli-v2" }
+# The format of a side file's backup copy: `backup::{seal, open}` (Argon2id +
+# XChaCha20-Poly1305), the same one the client's page keeps its half in.
+ksg-web-v2 = { path = "../ksg-web-v2" }
 # Anchor memos go out through the node's RPC; the wait comes from
 # `KSG_ANCHOR_WAIT_S` inside the anchorer itself.
 ksg-verify-v2 = { path = "../ksg-verify-v2" }

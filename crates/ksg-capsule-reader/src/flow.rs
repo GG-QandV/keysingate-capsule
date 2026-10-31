@@ -525,6 +525,7 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
     file.scan = B64.encode(fresh_scan_seed());
     file.write(&layout.client_side())?;
     write_maps(layout, &maps)?;
+    warn_backup_stale();
     Ok(value)
 }
 
@@ -730,6 +731,7 @@ fn initiate_remote_birth(
     file.scan = B64.encode(fresh_scan_seed());
     file.write(&layout.client_side())?;
     write_maps(layout, &maps)?;
+    warn_backup_stale();
     Ok(value)
 }
 
@@ -1107,4 +1109,105 @@ fn write_maps(layout: &Layout, maps: &MapSeeds) -> Result<(), String> {
     owner.map = B64.encode(maps.1.as_slice());
     owner.write(&layout.owner_side())?;
     Ok(())
+}
+
+/// After `initiate` the client's file is another one (the half, the scan key):
+/// a copy taken before it no longer restores it.
+fn warn_backup_stale() {
+    eprintln!("make a new backup of the side files (the maps changed)");
+}
+
+/// The environment variable naming the file that holds the backup password.
+pub const BACKUP_PASSWORD_FILE: &str = "KSG_BACKUP_PASSWORD_FILE";
+
+/// The backup password: the first line of the file `KSG_BACKUP_PASSWORD_FILE`
+/// names. Never an argument, never printed — not even in an error.
+fn backup_password() -> Result<Zeroizing<Vec<u8>>, String> {
+    let path = std::env::var_os(BACKUP_PASSWORD_FILE)
+        .ok_or_else(|| format!("{BACKUP_PASSWORD_FILE} names no password file"))?;
+    let raw = Zeroizing::new(
+        std::fs::read(&path).map_err(|e| format!("{}: {e}", Path::new(&path).display()))?,
+    );
+    let end = raw
+        .iter()
+        .position(|b| *b == b'\n' || *b == b'\r')
+        .unwrap_or(raw.len());
+    let password = Zeroizing::new(raw.get(..end).unwrap_or_default().to_vec());
+    if password.is_empty() {
+        return Err("the backup password file is empty".into());
+    }
+    Ok(password)
+}
+
+/// The side file's role of `party`.
+const fn role_of(party: Party) -> Role {
+    match party {
+        Party::Client => Role::Client,
+        Party::Owner => Role::Owner,
+    }
+}
+
+/// Seals the whole JSON of `party`'s side file with the password from
+/// `KSG_BACKUP_PASSWORD_FILE` and writes the copy to `out` (mode `0600`).
+///
+/// # Errors
+///
+/// The side file or the password file does not read, the password is empty,
+/// or `out` does not write.
+pub fn backup(layout: &Layout, party: Party, out: &Path) -> Result<(), String> {
+    let password = backup_password()?;
+    let json = Zeroizing::new(
+        std::fs::read(layout.side(party)).map_err(|e| format!("{}: {e}", layout.side(party).display()))?,
+    );
+    let file = SideFile::from_json(&json)?;
+    if file.role != role_of(party) {
+        return Err(format!("{}: not that party's file", layout.side(party).display()));
+    }
+    let sealed = ksg_web_v2::backup::seal(&json, &password, &mut OsRng)
+        .map_err(|e| format!("backup: {e}"))?;
+    let tmp = out.with_extension("tmp");
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::io::Write::write_all(&mut f, &sealed).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp, out).map_err(|e| format!("{}: {e}", out.display()))
+}
+
+/// Restores `party`'s side file from a copy, **only if the file is absent**,
+/// and only if the map in the copy opens the current capsule.
+///
+/// # Errors
+///
+/// The file exists already; the copy does not read or the password is wrong;
+/// the copy is another party's; the copy is stale (its map opens no slot of
+/// the capsule); the file does not write.
+pub fn restore(layout: &Layout, party: Party, from: &Path) -> Result<(), String> {
+    let target = layout.side(party);
+    if target.exists() {
+        return Err(format!("{} exists: a restore never overwrites", target.display()));
+    }
+    let password = backup_password()?;
+    let blob = std::fs::read(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    let json = Zeroizing::new(
+        ksg_web_v2::backup::open(&blob, &password)
+            .map_err(|_| "the backup does not open: wrong password or not a backup".to_string())?,
+    );
+    let file = SideFile::from_json(&json)?;
+    if file.role != role_of(party) {
+        return Err("the backup is another party's file".into());
+    }
+    let capsule = std::fs::read(layout.capsule())
+        .map_err(|e| format!("{}: {e}", layout.capsule().display()))?;
+    let map = file.map()?;
+    ksg_container_v2::capsule::open_split(&capsule, &map)
+        .map_err(|_| "the backup is stale: its map does not open the current capsule".to_string())?;
+    file.write(&target)
 }
