@@ -1,4 +1,4 @@
-//! K3 (`Spec_kapsula` §27, `[р]` 31.10 «Б»): the issuer's command goes out
+//! K3 (`Spec_kapsula` §27, `[decision]` 31.10 «B»): the issuer's command goes out
 //! as a blind memo under the command key; the client's reader finds it among
 //! the payer's transactions and applies it — once.
 

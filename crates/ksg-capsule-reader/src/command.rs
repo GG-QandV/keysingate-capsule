@@ -1,4 +1,4 @@
-//! K3 (`Spec_kapsula` §27, `[р]` 31.10 «Б»): commands from the network.
+//! K3 (`Spec_kapsula` §27, `[decision]` 31.10 «B»): commands from the network.
 //!
 //! A party that holds no map (the issuer for E-13 `Finalize` and E-24, the
 //! claimant for the delivery of a dispute) signs a [`CommandFile`] and
@@ -141,7 +141,7 @@ fn container_and_head(layout: &Layout, party: Party) -> Result<(Hash, Option<Com
 }
 
 /// The issuer's command for the capsule as it is now, signed with the
-/// stand's issuer key (a stand key, `[р]` 25.10).
+/// stand's issuer key (a stand key, `[decision]` 25.10).
 ///
 /// # Errors
 ///
@@ -212,7 +212,7 @@ pub struct Report {
     /// Commands the container refused, with the reason (a replay among them).
     pub refused: Vec<String>,
     /// Anchors of this container's commands with no file: not applied, and
-    /// the anchor is the proof that they exist (§5а, П-10).
+    /// the anchor is the proof that they exist (§5a, P-10).
     pub unmatched: Vec<String>,
     /// Files with no anchor found: not published, not applied.
     pub unpublished: Vec<String>,
@@ -334,7 +334,7 @@ pub fn apply(layout: &Layout, party: Party) -> Result<Report, String> {
 }
 
 /// How many records a capsule writes without the network having been asked
-/// for its commands (`[р]` 01.11 «В»: the same window as `light`'s ten
+/// for its commands (`[decision]` 01.11 «V»: the same window as `light`'s ten
 /// records off the anchors, `ksg_cli_v2::base_anchor::OFFLINE_RECORDS`).
 pub const OFFLINE_CHECKS: u32 = 10;
 
@@ -371,7 +371,7 @@ fn note(layout: &Layout, line: &str) {
     }
 }
 
-/// K3 (`Spec_kapsula` §27, «Автоприменение», `[р]` 01.11 «В»): the network's
+/// K3 (`Spec_kapsula` §27, «auto-apply», `[decision]` 01.11 «V»): the network's
 /// commands go in **before** the holder's own — a holder's page first would
 /// leave a command signed over the old head stale for good. Skipped for a
 /// capsule without `anchor.json` (no Solana: commands are neither published

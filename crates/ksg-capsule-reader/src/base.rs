@@ -1,5 +1,5 @@
-//! Base Sepolia anchors of a `light` capsule (`Spec_kapsula` §22, "Уточнение
-//! по коду — С9"): the module asks for none (`a_light_work_owes_nothing`), so
+//! Base Sepolia anchors of a `light` capsule (`Spec_kapsula` §22, "code-level
+//! detail — C9"): the module asks for none (`a_light_work_owes_nothing`), so
 //! the schedule of the stand — before a value goes out, every ten records,
 //! right after initiation — is the reader's work, run through
 //! [`ksg_cli_v2::base_anchor::anchor_due`].
@@ -172,7 +172,7 @@ pub(crate) struct Anchoring {
 impl Anchoring {
     /// The capsule's Base state, or `None` for a capsule without `--base`
     /// (its behaviour is unchanged). Refuses a copy: nothing but the full
-    /// export goes on from a file the contract has refused (Л10: before any
+    /// export goes on from a file the contract has refused (L10: before any
     /// write).
     ///
     /// # Errors

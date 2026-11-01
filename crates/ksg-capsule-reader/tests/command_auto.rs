@@ -1,4 +1,4 @@
-//! K3 (`Spec_kapsula` §27, «Автоприменение», `[р]` 01.11 «В»): the network's
+//! K3 (`Spec_kapsula` §27, «auto-apply», `[decision]` 01.11 «V»): the network's
 //! commands are looked for before the holder's action; without the network,
 //! at most ten records, then the next one waits.
 

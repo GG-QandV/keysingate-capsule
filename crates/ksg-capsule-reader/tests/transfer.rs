@@ -1,5 +1,5 @@
-//! `Spec_kapsula` §21, E-9 (С6): the owner hands the container over to a new
-//! owner through the capsule. Н-3: after the transfer the former owner's map
+//! `Spec_kapsula` §21, E-9 (C6): the owner hands the container over to a new
+//! owner through the capsule. N-3: after the transfer the former owner's map
 //! opens nothing, the new owner's opens the owner's slot, the client works on.
 
 use ksg_capsule_module::session::{Answer, Request};
@@ -54,11 +54,11 @@ fn after_the_transfer_the_former_owners_map_opens_nothing() {
     assert_ne!(new.half, former.half, "the owner's key is the new owner's");
     assert_eq!(new.container, former.container);
     let capsule = std::fs::read(layout.capsule()).expect("the capsule");
-    // Н-3: the former owner's map opens nothing; the new one opens the
+    // N-3: the former owner's map opens nothing; the new one opens the
     // owner's slot; the client's map is the one it was.
     assert!(
         open_split(&capsule, &former.map().expect("a map")).is_err(),
-        "Н-3: the former owner's map still opens the capsule"
+        "N-3: the former owner's map still opens the capsule"
     );
     let opened = open_split(&capsule, &new.map().expect("a map")).expect("the new owner opens");
     assert_eq!(opened.role, MapRole::Owner);
@@ -148,7 +148,7 @@ fn a_bare_without_a_former_half_changes_owner() {
     let former = SideFile::read(&layout.owner_side()).expect("the owner's file");
     flow::transfer(&layout).expect("the transfer");
     let capsule = std::fs::read(layout.capsule()).expect("the capsule");
-    assert!(open_split(&capsule, &former.map().expect("a map")).is_err(), "Н-3 in a bare");
+    assert!(open_split(&capsule, &former.map().expect("a map")).is_err(), "N-3 in a bare");
     let new = SideFile::read(&layout.owner_side()).expect("the owner's file");
     assert!(open_split(&capsule, &new.map().expect("a map")).is_ok());
     flow::export_page(&layout, 1, Party::Owner).expect("the new owner exports");

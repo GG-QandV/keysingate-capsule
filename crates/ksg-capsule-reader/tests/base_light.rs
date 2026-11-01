@@ -1,4 +1,4 @@
-//! `Spec_kapsula` §22, "Уточнение по коду — С9": a `light` capsule anchors on
+//! `Spec_kapsula` §22, "code-level detail — C9": a `light` capsule anchors on
 //! Base Sepolia (a node in a thread — `ksg-cli-v2/tests/mock_base`): after
 //! initiation, before a value goes out, past the ten offline records; a copy
 //! learns it is one and does nothing but the full export; a transfer hands

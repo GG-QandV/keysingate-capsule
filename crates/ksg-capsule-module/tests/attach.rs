@@ -174,7 +174,7 @@ fn a_wire_that_does_not_read_is_refused_with_a_reason() {
     assert!(matches!(&answer, Answer::Refused { reason } if !reason.is_empty()), "{answer:?}");
 }
 
-// --- E-7 and E-8: the two page kinds `Session::page` gained (`[р]` 31.10 «А»)
+// --- E-7 and E-8: the two page kinds `Session::page` gained (`[decision]` 31.10 «A»)
 
 fn rule(scope: ksg_core_v2::journal::RuleScope) -> Request {
     Request::Attach {

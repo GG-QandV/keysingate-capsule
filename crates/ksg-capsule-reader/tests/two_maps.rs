@@ -1,4 +1,4 @@
-//! `Spec_kapsula` §21, 4б.4а: after the initiation the client and the owner
+//! `Spec_kapsula` §21, 4b.4a: after the initiation the client and the owner
 //! open the capsule with maps of their own, born at the reader; the holder's
 //! map (the issuer's printing stand knows it) opens nothing any more.
 
@@ -55,7 +55,7 @@ fn after_the_initiation_each_party_has_its_own_map() {
     };
     assert!(status["pages"].as_u64().unwrap_or(0) >= 2, "the owner sees the client's page: {status}");
 
-    // K2 (§26, Р-4): what the owner's map opens — the state — carries no
+    // K2 (§26, R-4): what the owner's map opens — the state — carries no
     // half of the client's key; the client's part does.
     let opened = open_split(&capsule, &owner.map().expect("a map")).expect("the owner opens");
     let part = |kind| {
@@ -67,10 +67,10 @@ fn after_the_initiation_each_party_has_its_own_map() {
     let template = Hash::from_multihash(&shared.template).expect("template");
     let state = Container::open_sealed(&part(PartKind::State), &template, &key).expect("the state");
     assert!(state.born());
-    assert!(!state.holds_client_half(), "Р-4: the owner's map gives no client's half");
+    assert!(!state.holds_client_half(), "R-4: the owner's map gives no client's half");
     assert!(
         opened.parts.iter().all(|p| p.kind != PartKind::ClientSecrets),
-        "Р-4: the client's part is not the owner's"
+        "R-4: the client's part is not the owner's"
     );
     let by_client = open_split(&capsule, &client.map().expect("a map")).expect("the client opens");
     assert!(

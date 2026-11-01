@@ -191,7 +191,7 @@ pub enum Request {
         /// from the pressing on.
         holder_map: capsule::MapPub,
     },
-    /// E-4 done (§21, 4б.4а): the holder's map gives way to the client's and
+    /// E-4 done (§21, 4b.4a): the holder's map gives way to the client's and
     /// the owner's — each born at its party's, only the public halves come
     /// in. Once, after the initiation, while the capsule has one map.
     SetMaps {
@@ -273,7 +273,7 @@ pub enum Request {
     /// owner. The owner's signature and the arriving owner's
     /// (`NeedsSignature {party: "buyer"}`) come from outside; the page of the
     /// change of owner goes into the journal. After it the owner's slot is
-    /// sealed to `owner_map` — the former owner's map opens nothing (Н-3).
+    /// sealed to `owner_map` — the former owner's map opens nothing (N-3).
     ///
     /// The former owner's secrets part rides through a client's session
     /// sealed to the former map: an empty one is made again under the new map
@@ -353,7 +353,7 @@ pub enum Request {
 }
 
 /// What [`Request::Attach`] carries: the wire's own type, as `Evidence` has
-/// no serde (`Spec_kapsula` §20, "Нагрузка"). On the wire a word `"what"`
+/// no serde (`Spec_kapsula` §20, "Load"). On the wire a word `"what"`
 /// names the case.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "what", rename_all = "snake_case", deny_unknown_fields)]
@@ -731,17 +731,17 @@ enum PageToWrite {
     /// The page of a change of form (E-10, CH-30).
     Form(Mode),
     /// E-7: the page of the rule of two seals (`Body::Rule`, CH-19) —
-    /// `[р]` 31.10 «А».
+    /// `[decision]` 31.10 «A».
     Rule(ksg_core_v2::journal::SealRule),
     /// A record of this kind whose page names its content type (E-8: the
-    /// ownership claim, `OWNERSHIP_CLAIM_PAGE`) — `[р]` 31.10 «А».
+    /// ownership claim, `OWNERSHIP_CLAIM_PAGE`) — `[decision]` 31.10 «A».
     Typed(RecordKind, Piece, Uri),
     /// E-9: the page of a change of owner, to the owner arriving with the
-    /// command (`Body::Transfer`, `OwnerChange`) — `[р]` 31.10 «А» С6/С7.
+    /// command (`Body::Transfer`, `OwnerChange`) — `[decision]` 31.10 «A» C6/C7.
     /// Pressed by [`Request::Transfer`].
     OwnerChange(PublicKey),
     /// E-14 slot 1 / E-5 slot 2: the page of the coupling of containers
-    /// (CH-12) — `[р]` 31.10 «ок А» (С10).
+    /// (CH-12) — `[decision]` 31.10 «ok A» (C10).
     Coupling(ksg_core_v2::journal::CouplingRecord),
 }
 
@@ -924,7 +924,7 @@ impl Session {
         let state_key = decode_32(&shared.state_key, "shared secrets: state key")?;
         let template =
             Hash::from_multihash(&shared.template).map_err(|e| format!("template: {e}"))?;
-        // K2 (§26, Р-4): the halves come from the parties' own parts — the
+        // K2 (§26, R-4): the halves come from the parties' own parts — the
         // ones this session opened; an empty part (a capsule sealed before
         // K2) leaves the half where it was, in the state.
         let own = |kind: PartKind| {
@@ -1160,10 +1160,10 @@ impl Session {
             ));
         }
         let mut rng = CspRng;
-        // Two maps (§21, 4б.4а): v2 — the other party's private part rides
+        // Two maps (§21, 4b.4a): v2 — the other party's private part rides
         // through unopened. One map: as before.
         if self.maps.len() > 1 {
-            // K2 (§26, Р-4): each half goes to its party's part when this
+            // K2 (§26, R-4): each half goes to its party's part when this
             // session writes that part (it opened it, or the capsule has none);
             // a part riding through sealed keeps its half in the state, as
             // before K2 — never lost.
@@ -2966,7 +2966,7 @@ impl Session {
         ticked
     }
 
-    /// E-7: the page of the rule of two seals (`[р]` 31.10 «А»).
+    /// E-7: the page of the rule of two seals (`[decision]` 31.10 «A»).
     fn rule_page(
         &mut self,
         rule: ksg_core_v2::journal::SealRule,
@@ -2981,7 +2981,7 @@ impl Session {
         self.seal_draft(draft).map(|(w, n)| (Some(w), n))
     }
 
-    /// E-9: the page of a change of owner to `to` (`[р]` 31.10 «А» С6/С7).
+    /// E-9: the page of a change of owner to `to` (`[decision]` 31.10 «A» C6/C7).
     fn owner_change_page(
         &mut self,
         to: &PublicKey,
@@ -3018,7 +3018,7 @@ impl Session {
         Ok(())
     }
 
-    /// The page of a coupling (CH-12; `[р]` 31.10 «ок А», С10).
+    /// The page of a coupling (CH-12; `[decision]` 31.10 «ok A», C10).
     fn coupling_page(
         &mut self,
         record: ksg_core_v2::journal::CouplingRecord,
@@ -3033,7 +3033,7 @@ impl Session {
         self.seal_draft(draft).map(|(w, n)| (Some(w), n))
     }
 
-    /// A record whose page names its content type (E-8; `[р]` 31.10 «А»).
+    /// A record whose page names its content type (E-8; `[decision]` 31.10 «A»).
     fn typed_page(
         &mut self,
         kind: RecordKind,

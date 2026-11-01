@@ -151,7 +151,7 @@ pub struct Print {
     /// The module's bytes: the code part of the capsule.
     pub wasm: PathBuf,
     /// Where a `light` capsule anchors on Base Sepolia (`init --base`,
-    /// `Spec_kapsula` §22, С9); `None` — no anchors on Base.
+    /// `Spec_kapsula` §22, C9); `None` — no anchors on Base.
     pub base: Option<crate::base::BaseSpec>,
 }
 
@@ -245,7 +245,7 @@ pub fn init(layout: &Layout, print: &Print) -> Result<String, String> {
     // placeholder the seal path never trusts before initiation (flow.rs:232 was
     // the stand's copy, `O-5 A`: the issuer has no access to it).
     let scan = fresh_scan_seed();
-    // K3 (§27, `[р]` 31.10 «Б»): the command key — the issuer's, born here,
+    // K3 (§27, `[decision]` 31.10 «B»): the command key — the issuer's, born here,
     // kept at the stand and given to both parties.
     let cmd = fresh_scan_seed();
     crate::command::write_secret(&layout.stand().join("cmd.key"), &cmd)?;
@@ -543,7 +543,7 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
     file.write(&layout.client_side())?;
     write_maps(layout, &maps)?;
     warn_backup_stale();
-    // Ya-2 (`Spec_kapsula` §22, С9): the client's key is on — anchored at
+    // Ya-2 (`Spec_kapsula` §22, C9): the client's key is on — anchored at
     // once on Base if the network is there; if not, the next record waits
     // for it. The capsule is written already: an anchor never outruns it.
     if let Some(b) = base.as_mut() {
@@ -802,9 +802,9 @@ fn client_half(layout: &Layout) -> Result<MobileHalf, String> {
 ///
 /// Not initiated, refused, or the capsule does not write.
 pub fn work(layout: &Layout, text: &str) -> Result<serde_json::Value, String> {
-    // K3 (§27, `[р]` 01.11 «В»): the network's commands first.
+    // K3 (§27, `[decision]` 01.11 «V»): the network's commands first.
     crate::command::before_holder(layout, Party::Client, true)?;
-    // `light` on Base (§22, С9): a copy is refused before anything is
+    // `light` on Base (§22, C9): a copy is refused before anything is
     // written; past the ten offline records the record waits for an anchor.
     let mut base = crate::base::Anchoring::begin(layout)?;
     let mut session = open(layout, Party::Client)?;
@@ -836,7 +836,7 @@ pub fn work_mobile_web(
     mobile: &mut ksg_cli_v2::web_mobile::WebMobile,
     text: &str,
 ) -> Result<serde_json::Value, String> {
-    // K3 (§27, `[р]` 01.11 «В»): the network's commands first.
+    // K3 (§27, `[decision]` 01.11 «V»): the network's commands first.
     crate::command::before_holder(layout, Party::Client, true)?;
     let mut session = open(layout, Party::Client)?;
     let cmd = Request::Work { text: text.into() };
@@ -1043,9 +1043,9 @@ fn round_page(
 ///
 /// Not initiated, refused, or the capsule does not write.
 pub fn export_page(layout: &Layout, number: u64, party: Party) -> Result<Vec<u8>, String> {
-    // K3 (§27, `[р]` 01.11 «В»): the network's commands first.
+    // K3 (§27, `[decision]` 01.11 «V»): the network's commands first.
     crate::command::before_holder(layout, party, false)?;
-    // A value goes out only on a fresh anchor (`light` on Base, §22, С9).
+    // A value goes out only on a fresh anchor (`light` on Base, §22, C9).
     let mut base = crate::base::Anchoring::begin(layout)?;
     let mut session = open(layout, party)?;
     if let Some(b) = base.as_mut() {
@@ -1081,7 +1081,7 @@ pub fn export_page_mobile_web(
     mobile: &mut ksg_cli_v2::web_mobile::WebMobile,
     number: u64,
 ) -> Result<Vec<u8>, String> {
-    // K3 (§27, `[р]` 01.11 «В»): the network's commands first.
+    // K3 (§27, `[decision]` 01.11 «V»): the network's commands first.
     crate::command::before_holder(layout, Party::Client, false)?;
     let mut session = open(layout, Party::Client)?;
     let cmd = Request::ExportPage { number };
@@ -1124,7 +1124,7 @@ pub fn status(layout: &Layout) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("the status: {e}"))
 }
 
-/// Two maps after E-4 (`Spec_kapsula` §21, 4б.4а): each party's map is born
+/// Two maps after E-4 (`Spec_kapsula` §21, 4b.4a): each party's map is born
 /// here, at the reader that writes that party's file; the module gets the
 /// public halves only and seals the next capsule to them.
 /// The client's map seed and the owner's.
@@ -1168,7 +1168,7 @@ fn write_maps(layout: &Layout, maps: &MapSeeds) -> Result<(), String> {
 /// the module gets its public half only. Before the birth the capsule has one
 /// map, so the client's file and the owner's both get the new seed (the same
 /// way `initiate` splits them later). The buyer's signature is the stand's
-/// (`stand/parties.json`, a stand key — `[р]` 25.10); the owner's comes from
+/// (`stand/parties.json`, a stand key — `[decision]` 25.10); the owner's comes from
 /// the owner's file. `init` is not touched: it still lays E-2 and E-3 on the
 /// stand itself.
 ///
@@ -1242,11 +1242,11 @@ pub fn buyer_key(layout: &Layout) -> Result<serde_json::Value, String> {
 
 /// E-9 through the capsule (`Spec_kapsula` §21): the owner hands the container
 /// over to a new owner — the stand's buyer (`parties.json`, a stand key,
-/// `[р]` 25.10) takes the owner's seat.
+/// `[decision]` 25.10) takes the owner's seat.
 ///
 /// The new owner's map is born here, at the reader that writes the new
 /// owner's file; the module gets its public half only and seals the owner's
-/// slot to it. The former owner's map opens nothing afterwards (Н-3). The
+/// slot to it. The former owner's map opens nothing afterwards (N-3). The
 /// owner's file is rewritten after the capsule (as in `buyer_key`): its half
 /// becomes the new owner's key, its map seed the new one — the former seed
 /// is overwritten. A crash between the two leaves a capsule that no owner's
@@ -1265,7 +1265,7 @@ pub fn transfer(layout: &Layout) -> Result<serde_json::Value, String> {
 /// out on a fresh anchor, and the writer's seat on the contract goes to the
 /// new owner's EVM key (`evm_key`, else `stand/new_owner_evm.key` — the
 /// issuer's desk, as the stand's `owner_change --evm-key`): handed over now if
-/// the network answers, else before the next anchor (`Spec_kapsula` §22, С9).
+/// the network answers, else before the next anchor (`Spec_kapsula` §22, C9).
 ///
 /// # Errors
 ///
@@ -1275,7 +1275,7 @@ pub fn transfer_with_evm_key(
     layout: &Layout,
     evm_key: Option<&Path>,
 ) -> Result<serde_json::Value, String> {
-    // K3 (§27, `[р]` 01.11 «В»): the network's commands first.
+    // K3 (§27, `[decision]` 01.11 «V»): the network's commands first.
     crate::command::before_holder(layout, Party::Client, true)?;
     let mut base = crate::base::Anchoring::begin(layout)?;
     let new_key = if base.is_some() {
