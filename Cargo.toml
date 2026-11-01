@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members  = ["crates/ksg-capsule-module", "crates/ksg-capsule-reader"]
+
+[workspace.package]
+version      = "2.0.0-alpha.1"
+edition      = "2021"
+rust-version = "1.81"
+license      = "Apache-2.0"
+repository   = "https://github.com/keysingate/keysingate-capsule"
+
+[workspace.dependencies]
+serde       = { version = "1", features = ["derive"] }
+serde_json  = { version = "1", features = ["preserve_order"] }
+sha2        = "0.10"
+ed25519-dalek = "2"
+base64       = "0.22"
+bs58         = "0.5"
+thiserror    = "2"
+serde_json_canonicalizer = "0.3"
+hex          = "0.4"
+fips204      = { version = "0.4.6", default-features = false, features = ["ml-dsa-65", "default-rng"] }
+trybuild     = "1"
+jsonschema   = { version = "0.52", default-features = false }
+# Property tests (gap 13.10: mutations, property tests, fuzzing — run 1 of 2–3).
+proptest     = { version = "=1.12.0", default-features = false, features = ["std"] }
+# Outside the core, for the container (ksg-container-v2): the layer key, the
+# client's split key, wiping key material. Same versions as core v1's
+# workspace, chosen independently here — the two lock files do not meet.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+hkdf         = "0.12"
+fips203      = { version = "0.4.3", default-features = false, features = ["ml-kem-768"] }
+frost-ed25519 = { version = "3", default-features = false, features = ["serialization"] }
+zeroize      = { version = "1", default-features = false, features = ["alloc", "zeroize_derive"] }
+
+# Goal 1, step G1-3 (owner's decision 09.10): third-party crates and crypto
+# build optimized even under `cargo test`. Our own code stays unoptimized, so
+# debugging does not suffer; the slow test files (service, devnet, channel,
+# cli, store, journal) spend their time in dependencies.
+[profile.dev.package."*"]
+opt-level = 3
+
+# tiny_http 0.12.0 with a bounded body drain (third_party/tiny_http-0.12.0/
+# KEYSINGATE_PATCH.md): upstream aborts the process on a huge Content-Length.
+[patch.crates-io]
+tiny_http = { git = "https://github.com/keysingate/keysingate-core", rev = "d2ce37fe76a4e2d2c3414e53d86c01724280566d" }

@@ -4,7 +4,7 @@
 //! learns it is one and does nothing but the full export; a transfer hands
 //! the writer's seat to the new owner's key. Without `--base` nothing changes.
 
-#[path = "../../ksg-cli-v2/tests/mock_base/mod.rs"]
+#[path = "mock_base/mod.rs"]
 mod mock_base;
 
 use std::path::{Path, PathBuf};

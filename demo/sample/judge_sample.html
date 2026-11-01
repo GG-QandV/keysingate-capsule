@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Judge page — c-judge-demo</title>
+</head>
+<body>
+<div style="background:#fff3cd;border:3px solid #b58900;padding:12px;font-weight:bold;text-align:center;">SAMPLE — built from a synthetic fixture, not from a live run. The live page is produced by scripts/demo_orchestrator.sh into demo/out/judge.html.</div>
+<h1>Claim case — c-judge-demo</h1>
+<h2>(1) Journal pages in order</h2>
+<article id="p-1">
+<h3>Page 1 — input — UNKNOWN</h3>
+<pre>input: claim 4417, water damage
+policy_lookup clause 7.2</pre>
+<p>Verify: not checked (no binary/keys)</p>
+</article>
+<article id="p-2">
+<h3>Page 2 — model call — UNKNOWN</h3>
+<pre>tool call: ksg_model_call
+model: muse-spark-1.3
+Exclusion 7.2 applies.</pre>
+<p>Verify: not checked (no binary/keys)</p>
+</article>
+<article id="p-3">
+<h3>Page 3 — SAM mask — UNKNOWN</h3>
+<pre>tool call: ksg_mask_damage
+model: sam-3.1
+box: 0,0,1,1
+mask sha256: abc</pre>
+<p>Verify: not checked (no binary/keys)</p>
+</article>
+<article id="p-4">
+<h3>Page 4 — decision — UNKNOWN</h3>
+<pre>result: rejected under 7.2, gradual leak</pre>
+<p>Verify: not checked (no binary/keys)</p>
+</article>
+<h2>(2) Capsule noise before/after</h2>
+<p>No capsule files given (--capsule-before/--capsule-after).</p>
+<h2>(3) SAM mask recheck</h2>
+<p>Mask not rechecked (no --mask-json).</p>
+<h2>(4) Explanation for the judge</h2>
+<p>Citations checked by program: [4, 1, 2, 3]</p>
+<div>Decision: rejected under 7.2 <a href="#p-4">[p:4]</a><span> (checked by program)</span>, input claim <a href="#p-1">[p:1]</a><span> (checked by program)</span>, model cites exclusion <a href="#p-2">[p:2]</a><span> (checked by program)</span>, mask checked <a href="#p-3">[p:3]</a><span> (checked by program)</span>.
+</div>
+</body>
+</html>

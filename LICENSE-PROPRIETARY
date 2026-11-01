@@ -1,0 +1,20 @@
+Keysingate — proprietary components
+Copyright 2026 Yevhenii Nam. All rights reserved.
+
+This licence covers the crates whose Cargo.toml names this file in
+`license-file`: ksg-container, ksg-issuer, ksg-log, ksg-anchor, ksg-service,
+ksg-custody and ksg-witness — the parts from which an issuer, a container and
+its services are built.
+
+No right to use, copy, modify, merge, publish, distribute, sublicense or sell
+these components, or to run them in any environment, is granted except under a
+separate written agreement with the copyright holder (the release licence
+agreement). Holding a copy of the source code grants no such right.
+
+The components that a third party needs to verify evidence without the
+copyright holder — the core (ksg-core), the journal format and its verification
+(ksg-journal), the verifier (ksg-verify), the test-vector generator
+(ksg-vectors) and the JSON Schemas — are licensed separately under the Apache
+License 2.0 (LICENSE).
+
+THESE COMPONENTS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.

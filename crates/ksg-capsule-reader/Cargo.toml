@@ -16,19 +16,19 @@ name = "ksg-capsule"
 path = "src/main.rs"
 
 [dependencies]
-ksg-container-v2 = { path = "../ksg-container-v2" }
-ksg-core-v2 = { path = "../ksg-core-v2" }
+ksg-container-v2 = { git = "https://github.com/keysingate/keysingate-core", rev = "9064b7421dc9d06c27f798fdfd6a82f00ff38a41" }
+ksg-core-v2 = { git = "https://github.com/keysingate/keysingate-core", rev = "9064b7421dc9d06c27f798fdfd6a82f00ff38a41" }
 # The wire of the boundary and the wire types of the session (open/call/close).
 ksg-capsule-module = { path = "../ksg-capsule-module" }
 # The stand's print (`init`) and the owner's file: the capsule is the same
 # container, printed by the issuer's desk.
-ksg-cli-v2 = { path = "../ksg-cli-v2" }
-# The format of a side file's backup copy: `backup::{seal, open}` (Argon2id +
-# XChaCha20-Poly1305), the same one the client's page keeps its half in.
-ksg-web-v2 = { path = "../ksg-web-v2" }
+ksg-cli-v2 = { git = "https://github.com/keysingate/keysingate-core", rev = "9064b7421dc9d06c27f798fdfd6a82f00ff38a41" }
 # Anchor memos go out through the node's RPC; the wait comes from
 # `KSG_ANCHOR_WAIT_S` inside the anchorer itself.
-ksg-verify-v2 = { path = "../ksg-verify-v2" }
+ksg-verify-v2 = { git = "https://github.com/keysingate/keysingate-core", rev = "9064b7421dc9d06c27f798fdfd6a82f00ff38a41" }
+# The format of a side file's backup copy: `backup::{seal, open}` (Argon2id +
+# XChaCha20-Poly1305), the same one the client's page keeps its half in.
+ksg-web-v2 = { git = "https://github.com/keysingate/keysingate-core", rev = "9064b7421dc9d06c27f798fdfd6a82f00ff38a41" }
 # The engine: the latest stable wasmtime compatible with the pinned toolchain.
 wasmtime = { version = "47.0.4", default-features = false, features = ["cranelift", "runtime"] }
 serde.workspace = true
@@ -41,17 +41,17 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 
 [dev-dependencies]
 # K5: the export is checked by the verifier itself, not by a copy of its rules.
-ksg-verify-v2 = { path = "../ksg-verify-v2", default-features = false, features = ["rpc"] }
+ksg-verify-v2 = { git = "https://github.com/keysingate/keysingate-core", rev = "9064b7421dc9d06c27f798fdfd6a82f00ff38a41", default-features = false, features = ["rpc"] }
 # The test stand's container: the module's own kit is private, so the reader's
 # K5 test prints through the stand exactly as `init` does.
 ksg-capsule-module = { path = "../ksg-capsule-module" }
 # K3: the network command test answers through a fake node with memos.
 bs58.workspace = true
 # C9: a Base Sepolia node in the tests — the contract runs in revm
-# (`ksg-cli-v2/tests/mock_base`, included by path).
+# (`tests/mock_base`, the pre-existing core's test node, copied here).
 revm = { version = "=14.0.3", default-features = false, features = ["std"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
-ksg-anchor-v2 = { path = "../ksg-anchor-v2" }
+ksg-anchor-v2 = { git = "https://github.com/keysingate/keysingate-core", rev = "9064b7421dc9d06c27f798fdfd6a82f00ff38a41" }
 
 [lints.rust]
 missing_docs = "warn"

@@ -1,0 +1,13 @@
+# The version is pinned exactly, not as `stable`.
+#
+# Reason: the negative-compilation tests (`crates/ksg-core/tests/ui/*.stderr`)
+# are compared against the compiler's diagnostics verbatim. A floating `stable`
+# would break them on every toolchain update — and would break precisely the
+# tests that prove the typestates work.
+#
+# To bump the version: raise `channel`, then run `TRYBUILD=overwrite cargo test`
+# and read the `.stderr` diff with your own eyes. A change in wording is fine;
+# a change in WHICH error is emitted is a part-1 regression.
+[toolchain]
+channel    = "1.94.1"
+components = ["rustfmt", "clippy"]
