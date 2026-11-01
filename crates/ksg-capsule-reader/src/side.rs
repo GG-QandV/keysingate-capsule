@@ -40,6 +40,12 @@ pub struct SideFile {
     pub map: String,
     /// The scan key for blind anchors, base64url (32 bytes).
     pub scan: String,
+    /// K3 (`Spec_kapsula` §27, `[р]` 31.10 «Б»): the command key — born by
+    /// the issuer at printing, the same in both parties' files; the blind
+    /// link of a network command (`ksg:cmd:v1`) is made with it. Empty in a
+    /// file printed before K3.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cmd: String,
 }
 
 impl Drop for SideFile {
@@ -47,6 +53,7 @@ impl Drop for SideFile {
         self.half.zeroize();
         self.map.zeroize();
         self.scan.zeroize();
+        self.cmd.zeroize();
     }
 }
 
@@ -61,6 +68,7 @@ impl SideFile {
             half: B64.encode(half),
             map: B64.encode(map_seed),
             scan: B64.encode(scan),
+            cmd: String::new(),
         }
     }
 

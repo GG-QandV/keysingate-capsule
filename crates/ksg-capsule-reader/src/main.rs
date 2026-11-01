@@ -4,9 +4,11 @@
 //! ksg-capsule --home DIR init [--class light|heavy|bare] [--emission ksg:em:test:NNNNNN]
 //!                              [--serial N] [--artifact URI] [--anchor solana:CLUSTER
 //!                              (--payer KEYFILE | --service URL --holder ID) [--rpc URL]]
-//!                              [--wasm PATH]
+//!                              [--wasm PATH] [--base RPC,CONTRACT,KEYFILE]
+//! ksg-capsule --home DIR buyer-key
 //! ksg-capsule --home DIR initiate [--mobile-web ADDR] [--web-root DIR]
 //! ksg-capsule --home DIR work TEXT [--mobile-web ADDR] [--web-root DIR]
+//! ksg-capsule --home DIR transfer [--evm-key FILE]
 //! ksg-capsule --home DIR export-page N [--by client|owner] [--mobile-web ADDR] [--web-root DIR]
 //! ksg-capsule --home DIR keys [--out FILE]
 //! ksg-capsule --home DIR status
@@ -31,9 +33,18 @@ const USAGE: &str = "\
 ksg-capsule --home DIR init [--class light|heavy|bare] [--emission ksg:em:test:NNNNNN]
                              [--serial N] [--artifact URI] [--anchor solana:CLUSTER
                              (--payer KEYFILE | --service URL --holder ID) [--rpc URL]]
-                             [--wasm PATH]
+                             [--wasm PATH] [--base RPC,CONTRACT,KEYFILE]
+  (--base: a `light` capsule anchors on Base Sepolia; KEYFILE is the path to the
+   sender's key file, never the key)
+ksg-capsule --home DIR buyer-key
+ksg-capsule --home DIR issue-command finalize|succeed|shares-lost [HASH]
+                             [LEADER for succeed]
+ksg-capsule --home DIR apply-commands [--party client|owner]
+ksg-capsule --home DIR pull TRAILER TRAILER_SEAL
 ksg-capsule --home DIR initiate [--mobile-web ADDR] [--web-root DIR]
 ksg-capsule --home DIR work TEXT [--mobile-web ADDR] [--web-root DIR]
+ksg-capsule --home DIR transfer [--evm-key FILE]
+  (on a Base capsule: the new owner's EVM key file; else stand/new_owner_evm.key)
 ksg-capsule --home DIR export-page N [--by client|owner] [--mobile-web ADDR] [--web-root DIR]
 ksg-capsule --home DIR keys [--out FILE]
 ksg-capsule --home DIR status
@@ -135,6 +146,93 @@ fn run(args: &[String]) -> Result<(), Problem> {
             println!("container {id}");
             println!("client   {}", layout.client_side().display());
             println!("owner    {}", layout.owner_side().display());
+            Ok(())
+        }
+        "issue-command" => {
+            // K3 (§27): the issuer's command, saved in commands/ and, with an
+            // anchor config, published as a blind `ksg:cmd:v1` memo.
+            let op = args.rest.get(1).ok_or_else(|| usage("issue-command finalize|succeed|shares-lost [HASH|LEADER]"))?;
+            let (op, evidence) = match op.as_str() {
+                "finalize" => (
+                    ksg_container_v2::Operation::Finalize,
+                    ksg_capsule_module::session::CommandEvidence::None,
+                ),
+                "succeed" => {
+                    let leader = args
+                        .rest
+                        .get(2)
+                        .map(|s| {
+                            ksg_core_v2::crypto::hash::Hash::from_multihash(s)
+                                .map_err(|_| usage("issue-command: LEADER is not a multihash"))
+                        })
+                        .transpose()?;
+                    (
+                        ksg_container_v2::Operation::Succeed,
+                        match leader {
+                            Some(leader) => ksg_capsule_module::session::CommandEvidence::AttachedTo { leader },
+                            None => ksg_capsule_module::session::CommandEvidence::None,
+                        },
+                    )
+                }
+                "shares-lost" => {
+                    let hash = args
+                        .rest
+                        .get(2)
+                        .ok_or_else(|| usage("issue-command shares-lost HASH"))?;
+                    let hash = ksg_core_v2::crypto::hash::Hash::from_multihash(hash)
+                        .map_err(|_| usage("issue-command: HASH is not a multihash"))?;
+                    (
+                        ksg_container_v2::Operation::DeclareSharesLost,
+                        ksg_capsule_module::session::CommandEvidence::SharesLost { hash },
+                    )
+                }
+                _ => return Err(usage("issue-command finalize|succeed|shares-lost [HASH|LEADER]")),
+            };
+            let file = ksg_capsule_reader::command::issue(&layout, op, evidence)?;
+            if flow::anchor_cfg(&layout)?.is_some() {
+                let sig = ksg_capsule_reader::command::publish(&layout, &file)?;
+                println!("published {sig}");
+            } else {
+                let (memo, path) = ksg_capsule_reader::command::save(&layout, &file)?;
+                println!("saved {} (no anchor config: memo not sent)\nmemo  {memo}", path.display());
+            }
+            Ok(())
+        }
+        "apply-commands" => {
+            let party = if args.get("party").is_some() { party_flag(&args)? } else { Party::Client };
+            let r = ksg_capsule_reader::command::apply(&layout, party)?;
+            println!(
+                "applied {:?}\nrefused {:?}\nanchored without a file (not applied) {:?}\nnot published {:?}",
+                r.applied, r.refused, r.unmatched, r.unpublished
+            );
+            Ok(())
+        }
+        "pull" => {
+            let trailer = args
+                .rest
+                .get(1)
+                .ok_or_else(|| usage("pull needs a trailer multihash"))?;
+            let trailer = ksg_core_v2::crypto::hash::Hash::from_multihash(trailer)
+                .map_err(|_| usage("pull: TRAILER is not a multihash"))?;
+            let seal = args
+                .rest
+                .get(2)
+                .ok_or_else(|| usage("pull needs the trailer's seal multihash"))?;
+            let seal = ksg_core_v2::crypto::hash::Hash::from_multihash(seal)
+                .map_err(|_| usage("pull: TRAILER_SEAL is not a multihash"))?;
+            let value = flow::pull(&layout, trailer, seal)?;
+            println!("{value}");
+            Ok(())
+        }
+        "buyer-key" => {
+            let value = flow::buyer_key(&layout)?;
+            println!("{value}");
+            Ok(())
+        }
+        "transfer" => {
+            let key = args.get("evm-key").map(std::path::Path::new);
+            let value = flow::transfer_with_evm_key(&layout, key)?;
+            println!("{value}");
             Ok(())
         }
         "initiate" => {
@@ -250,6 +348,24 @@ fn parse_print(args: &Args) -> Result<Print, Problem> {
     }
     if let Some(wasm) = args.get("wasm") {
         print.wasm = std::path::PathBuf::from(wasm);
+    }
+    if let Some(base) = args.get("base") {
+        if print.class != Class::Light {
+            return Err(usage("--base goes with a `light` capsule only"));
+        }
+        let mut parts = base.splitn(3, ',');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(rpc), Some(contract), Some(key))
+                if !rpc.is_empty() && !contract.is_empty() && !key.is_empty() =>
+            {
+                print.base = Some(ksg_capsule_reader::base::BaseSpec {
+                    rpc: rpc.to_string(),
+                    contract: contract.to_string(),
+                    key: std::path::PathBuf::from(key),
+                });
+            }
+            _ => return Err(usage("--base RPC,CONTRACT,KEYFILE")),
+        }
     }
     print.anchor = match args.get("anchor") {
         None => {

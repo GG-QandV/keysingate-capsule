@@ -169,7 +169,25 @@ impl Fixture {
         f
     }
 
-        /// A heavy (Pro) container, initiated, NOT yet opened: `OpenJournal` goes
+        /// A light container, initiated, page 0 written, with `distributor`
+    /// seated since the packet (a sale through a distributor, §19).
+    #[must_use]
+    pub fn started_with_distributor(distributor: ksg_core_v2::crypto::sign::PublicKey) -> Self {
+        let mut f = Self::printed_seated(
+            Class::Light,
+            Parties::new(),
+            TestRng(7),
+            false,
+            Some(distributor),
+        );
+        f.press_packet();
+        f.press_buyer_key();
+        f.press_initiate();
+        f.press_opening();
+        f
+    }
+
+    /// A heavy (Pro) container, initiated, NOT yet opened: `OpenJournal` goes
     /// through the module's own co-seal round trip.
     #[must_use]
     pub fn started_heavy_unopened() -> Self {
@@ -238,11 +256,36 @@ impl Fixture {
         f
     }
 
+    /// A heavy (Pro) container, initiated, page 0 written, with the issuer's
+    /// seal laid at printing (Pro signs every artefact with it, CT-48).
+    #[must_use]
+    pub fn started_heavy_sealed() -> Self {
+        let mut f = Self::printed_with(Class::Heavy, Parties::new(), TestRng(7), true);
+        f.press_packet();
+        f.press_buyer_key();
+        f.press_initiate();
+        f.press_opening();
+        f
+    }
+
     fn printed(class: Class, parties: Parties, rng: TestRng) -> Self {
         Self::printed_with(class, parties, rng, false)
     }
 
     fn printed_with(class: Class, parties: Parties, rng: TestRng, sealed: bool) -> Self {
+        Self::printed_seated(class, parties, rng, sealed, None)
+    }
+
+    /// As [`Fixture::printed_with`], with a distributor seated in the roster
+    /// before the container is assembled (the seat is taken with the packet,
+    /// §19; a born container takes none).
+    fn printed_seated(
+        class: Class,
+        parties: Parties,
+        rng: TestRng,
+        sealed: bool,
+        distributor: Option<ksg_core_v2::crypto::sign::PublicKey>,
+    ) -> Self {
         let mut rng = rng;
         let (inside, mobile) = split(client_kid(), &mut rng).expect("the client's key splits");
         let client = inside.public().clone();
@@ -277,12 +320,15 @@ impl Fixture {
             StatusSection::start(EMISSION, SERIAL, r0, a0, &issuer_keys, &Profile::default())
                 .expect("the section starts");
 
-        let roster = Roster::of([
+        let mut roster = Roster::of([
             (parties.issuer.public(), Role::Issuer),
             (parties.owner.public(), Role::Owner),
             (parties.buyer.public(), Role::Buyer),
             (client.clone(), Role::Client),
         ]);
+        if let Some(key) = distributor {
+            roster.add(key, Role::Distributor);
+        }
         let release = Release {
             id: EMISSION.into(),
             issued_at,

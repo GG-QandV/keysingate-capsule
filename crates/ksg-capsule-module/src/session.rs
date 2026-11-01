@@ -50,7 +50,7 @@
 //! |---|---|
 //! | `Code` | the module's own bytes — carried through untouched |
 //! | `State` | the container, sealed (`Container::seal_to_bytes`) under the state key |
-//! | `ClientSecrets`, `OwnerSecrets` | carried through untouched |
+//! | `ClientSecrets`, `OwnerSecrets` | with two maps, the client's half and the former client's half (K2, §26); with one, empty — the halves stay in the state |
 //! | `SharedSecrets` | [`Shared`]: the state key, the template's hash, the artefact, the clock, the maps' public halves |
 //!
 //! The state key and the maps' **public** halves live in `SharedSecrets`
@@ -75,8 +75,11 @@ use ksg_container_v2::client_key::{
     share_commitment, Commitment, MobileHalf, MobileShare, SigningRound,
 };
 use ksg_container_v2::container::{Container, Evidence, JournalWrite, UnloadRoute, Writes};
-use ksg_container_v2::layers::{OpenWith, SealTo, MLKEM_EK_LEN};
-use ksg_container_v2::{Event, Operation, Role, Where, Work, Wrapped};
+use ksg_container_v2::expert::{
+    entry_pieces, ExpertDisclosure, ExpertEntry, ExpertRecord, EXPERT_ENTRY_PAGE,
+};
+use ksg_container_v2::layers::{Level, OpenWith, SealTo, MLKEM_EK_LEN};
+use ksg_container_v2::{Attachment, Event, Kind, Operation, Role, Where, Work, Wrapped};
 use ksg_core_v2::anchor::Attestation;
 use ksg_core_v2::canonical::canonical_bytes;
 use ksg_core_v2::crypto::hash::Hash;
@@ -88,6 +91,11 @@ use ksg_core_v2::status::{transition_for, Outcome};
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use crate::secret::{OwnerKey, StateKey};
+
+/// What a private part of a v2 capsule takes with nothing inside: the key
+/// envelope, the nonce and the AEAD tag (`capsule.rs` `HANDOVER_LEN`, `NONCE`,
+/// `TAG`). A carried blob longer than this holds a secret.
+const EMPTY_PRIVATE_PART: usize = 32 + ksg_container_v2::layers::MLKEM_CT_LEN + 12 + 33 + 16 + 12 + 16;
 
 /// The anchor kind of a record this module presses offline. No network
 /// accepts it (`ksg-verify-v2` says so by name); the reader's anchor replaces
@@ -160,6 +168,29 @@ pub enum Request {
     /// outside: [`Answer::NeedsSignature`] `{party: "issuer"}`, then
     /// [`Request::Sign`], then this request again.
     ApplyPacket,
+    /// E-2 with the distributor's seat (`Spec_kapsula` §19): the distributor's
+    /// key is seated in the roster, then the packet is pressed as by
+    /// [`Request::ApplyPacket`]. The seat is taken before the pressing and
+    /// stays if the pressing is refused (as on the stand's `packet_seating`);
+    /// a repeat after a [`Answer::NeedsSignature`] with the same key goes on.
+    /// A new request, not a field of `ApplyPacket`: the old requests' JSON
+    /// reads as before.
+    ApplyPacketSeated {
+        /// The distributor's key.
+        distributor: PublicKey,
+    },
+    /// E-3 (`Spec_kapsula` §19): the buyer's key is laid up to level 2, with
+    /// the owner's consent; the holder's map gives way to the buyer's. The
+    /// signatures of the buyer (`NeedsSignature {party: "buyer"}`) and of the
+    /// owner come from outside. Before the initiation only, while the capsule
+    /// has one map.
+    ApplyBuyerKey {
+        /// The buyer's key.
+        buyer: PublicKey,
+        /// The buyer's map, public half only: the capsule is sealed to it
+        /// from the pressing on.
+        holder_map: capsule::MapPub,
+    },
     /// E-4 done (§21, 4б.4а): the holder's map gives way to the client's and
     /// the owner's — each born at its party's, only the public halves come
     /// in. Once, after the initiation, while the capsule has one map.
@@ -179,6 +210,14 @@ pub enum Request {
     FullExport,
     /// E-15: the client's key is lost; the owner declares the container dead.
     DeclareKeyLost,
+    /// E-15 by the other road (`Spec_kapsula` §24, C8): the distributor that
+    /// sold the packet and the client declare the container dead in the
+    /// owner's stead. The distributor holds no map: its signature comes from
+    /// outside (`NeedsSignature {party: "distributor"}`, then
+    /// [`Request::Sign`], then this request again). Refused before any
+    /// signature is asked if no distributor is seated (a direct sale). After
+    /// `Done` the container is dead.
+    DeclareKeyLostByDistributor,
     /// E-23: the issuer freezes the container on the owner's application —
     /// the issuer's signature comes from outside (§20).
     Freeze,
@@ -188,6 +227,64 @@ pub enum Request {
         /// The declaration's digest.
         hash: Hash,
     },
+    /// E-6 (`Spec_kapsula` §20): an artefact and the data about it go into the
+    /// journal. The client signs; in Pro the owner's seal on the page comes
+    /// from outside (`NeedsSignature {party: "owner"}`, then
+    /// [`Request::Sign`], then this request again). Only the artefact is
+    /// carried so far: the rule (E-7) and the claim (E-8) need a page the
+    /// session's `page` cannot write without a change to it.
+    Attach {
+        /// What is attached, in the wire's own type.
+        what: AttachWire,
+    },
+    /// K4 (`Spec_kapsula` §28): the follow-ups the container holds open — the
+    /// issuer's layer work after E-2, E-3, E-9 — as JSON, with the zone
+    /// position each sealed write must be bound to.
+    PendingTasks,
+    /// K4: the issuer's sealed fields for the follow-up `index`, at the
+    /// position [`Request::PendingTasks`] named.
+    WriteLayer {
+        /// The follow-up's index.
+        index: usize,
+        /// The sealed zone (`layout::ZONE_BYTES`).
+        #[serde(with = "b64")]
+        sealed: Vec<u8>,
+    },
+    /// K4: the layer key was handed over outside; the digest of the sealed
+    /// hand-over.
+    HandedOver {
+        /// The follow-up's index.
+        index: usize,
+        /// The digest of the sealed hand-over.
+        sealed: Hash,
+    },
+    /// K3 (`Spec_kapsula` §27): a command from the network — signed by a
+    /// party that holds no map, anchored as `ksg:cmd:v1`, found by the reader
+    /// with the scan key and handed in before the holder's own command.
+    ApplyCommand {
+        /// The command file's JSON ([`CommandFile`]).
+        #[serde(with = "b64")]
+        file: Vec<u8>,
+        /// The JSON of the `ksg_core_v2::anchor::Attestation` of its anchor.
+        #[serde(with = "b64")]
+        attestation: Vec<u8>,
+    },
+    /// E-9 (`Spec_kapsula` §21): the owner hands the container over to a new
+    /// owner. The owner's signature and the arriving owner's
+    /// (`NeedsSignature {party: "buyer"}`) come from outside; the page of the
+    /// change of owner goes into the journal. After it the owner's slot is
+    /// sealed to `owner_map` — the former owner's map opens nothing (Н-3).
+    ///
+    /// The former owner's secrets part rides through a client's session
+    /// sealed to the former map: an empty one is made again under the new map
+    /// at close, a non-empty one (a `bare`'s former client's half) is a
+    /// refusal — it needs the former owner's own session.
+    Transfer {
+        /// The arriving owner's key: it takes the owner's seat.
+        new_owner: PublicKey,
+        /// The arriving owner's map, public half only.
+        owner_map: capsule::MapPub,
+    },
     /// The other party's signature over exactly the bytes a
     /// [`Answer::NeedsSignature`] handed out (L-1: signatures are the
     /// reader's work). The JSON of a `ksg_core_v2::crypto::sign::Signature`;
@@ -195,6 +292,29 @@ pub enum Request {
     Sign {
         /// The signature's JSON.
         signature: Vec<u8>,
+    },
+    /// `AppointExpert` (`Spec_kapsula` §23): the principals name the
+    /// court's expert on a page of the journal. Signed by this session's own
+    /// side — the client in a client's session, the owner in an owner's
+    /// (either alone is enough); the entry itself carries its own principal's
+    /// signature, made outside.
+    AppointExpert {
+        /// The entry naming the expert, as the core reads it.
+        entry: ksg_container_v2::expert::ExpertEntry,
+    },
+    /// D-3 `DiscloseToExpert` (`Spec_kapsula` §23): the pages the expert
+    /// demanded go out. The client and the owner sign; the owner's signature
+    /// in a client's session comes through `NeedsSignature` / [`Request::Sign`].
+    /// The pages go to the session's outputs, as an export does.
+    Disclose {
+        /// The principals' entry naming the expert (it must be on a page).
+        entry: Box<ksg_container_v2::expert::ExpertEntry>,
+        /// The expert's own record, as the chain carries it.
+        expert_record: Box<ksg_container_v2::expert::ExpertRecord>,
+        /// The anchor of the expert's record in the chain.
+        record_anchor: Box<Attestation>,
+        /// The principals' command, in the scope the expert demanded.
+        disclosure: Box<ksg_container_v2::expert::ExpertDisclosure>,
     },
     /// Client round: mobile commitment comes in (stub until round state lands).
     ClientCommit {
@@ -207,6 +327,74 @@ pub enum Request {
         /// Mobile share bytes, base64url.
         #[serde(with = "b64")]
         share: Vec<u8>,
+    },
+    /// E-5 slot 2 of the coupling (CH-12): the leading container pulls the
+    /// trailer; its last seal comes with it. Pressed as `RecordWork` by the
+    /// client, like the stand's `reader.rs` `pull`.
+    Pull {
+        /// The trailing container.
+        trailer: Hash,
+        /// The trailer's last seal.
+        trailer_seal: Hash,
+    },
+    /// The owner and the client export everything by the road of a voluntary
+    /// opening (`FullExport`, st.12 — `Spec_kapsula` §17): the four parties
+    /// signed the opening itself (`VoluntaryOpening`), and the gate checks it
+    /// (`unload_gate.rs`, `Route::Voluntary`); the two holders' own signatures
+    /// over the press come from outside, as in [`Request::FullExport`].
+    /// After it the export goes to the session's outputs, and the container
+    /// is dead.
+    FullExportVoluntary {
+        /// The opening the four parties signed.
+        opening: Box<ksg_container_v2::voluntary::VoluntaryOpening>,
+        /// The anchor of the opening's declaration in the chain.
+        anchor: Attestation,
+    },
+}
+
+/// What [`Request::Attach`] carries: the wire's own type, as `Evidence` has
+/// no serde (`Spec_kapsula` §20, "Нагрузка"). On the wire a word `"what"`
+/// names the case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "what", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AttachWire {
+    /// E-6: the artefact this container is, and the data about it. The page
+    /// is the content's digest — the file stays with the client.
+    Artifact {
+        /// Its name. Required.
+        name: String,
+        /// The media type of the file.
+        mime: String,
+        /// The hash of the file's content.
+        content_hash: Hash,
+        /// Its size in bytes.
+        size: u64,
+        /// The offset at which the container was initiated — one of the
+        /// inputs to its identifier, which the container recomputes.
+        offset_ms: u64,
+        /// What it was made from, by artefact URIs.
+        #[serde(default)]
+        derived_from: Vec<String>,
+    },
+    /// E-7: the rule of two seals, set or lifted (CH-19); the owner seals the
+    /// page beside the client.
+    Rule {
+        /// The rule.
+        rule: ksg_core_v2::journal::SealRule,
+    },
+    /// E-8: the ownership claim — the agent's ID published in the chain
+    /// (step 1, made outside), recorded on a page of its own type.
+    Claim {
+        /// The hash of the artifact claimed.
+        artifact: Hash,
+        /// The publication's open ID.
+        open_id: String,
+        /// The agent's key the publication names.
+        agent: PublicKey,
+        /// The publication's signatures.
+        signatures: SignatureSet,
+        /// The publication's anchor in the chain.
+        anchor: Attestation,
     },
 }
 
@@ -273,6 +461,120 @@ pub enum Answer {
         /// Why, in the container's or the module's own words.
         reason: String,
     },
+}
+
+/// The operations that come from the network (K3, `Spec_kapsula` §27).
+/// E-14 `Succeed` joins with C10; E-15 by the orchestrator has no seat yet.
+pub const COMMAND_OPS: [Operation; 4] = [
+    Operation::Finalize,
+    Operation::ServeDispute,
+    Operation::DeclareSharesLost,
+    Operation::Succeed,
+];
+
+/// A command from the network (`ksg:cmd:v1`, `Spec_kapsula` §27), as the
+/// party that signed it keeps it and the reader finds it in `commands/`.
+///
+/// The signatures cover [`Event::subject`] of the event the file describes,
+/// and its `payload` is the JSON of [`CommandFile::evidence`]: the
+/// load is bound by the signatures, so a copy with another load does not
+/// press.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandFile {
+    /// Version: 1.
+    pub v: u32,
+    /// The operation.
+    pub op: Operation,
+    /// The container it is for, as a multihash.
+    pub container: Hash,
+    /// The journal head the signer saw; `None` before page 0.
+    pub head: Option<CommandHead>,
+    /// The load.
+    pub evidence: CommandEvidence,
+    /// The signatures over the event's subject.
+    pub signatures: SignatureSet,
+}
+
+/// [`ksg_container_v2::event::Head`] on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandHead {
+    /// The counter of the last page.
+    pub counter: u64,
+    /// The digest of that page.
+    pub page: Hash,
+}
+
+/// The load of a network command, on the wire (`Evidence` has no serde).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CommandEvidence {
+    /// No load (E-13 `Finalize`).
+    None,
+    /// E-24: the declaration's digest.
+    SharesLost {
+        /// The digest.
+        hash: Hash,
+    },
+    /// The delivery of a dispute: the copy of the claim, naming the
+    /// claimant's and the arbiter's keys (K1).
+    Dispute {
+        /// The filing.
+        filing: Box<ksg_container_v2::Filing>,
+    },
+    /// E-14 (C10): slot 1 of the coupling — this container is attached to
+    /// its successor. No load beyond the leader's hash.
+    AttachedTo {
+        /// The leading container.
+        leader: Hash,
+    },
+}
+
+impl CommandFile {
+    /// The event this file presents, and its load as the container reads it.
+    ///
+    /// # Errors
+    ///
+    /// The load does not encode.
+    pub fn event(&self) -> Result<(Event, Evidence), String> {
+        // The load's JSON as this type writes it — the signer and the
+        // container build it with the same code, field by field.
+        let payload =
+            serde_json::to_vec(&self.evidence).map_err(|e| format!("the load does not encode: {e}"))?;
+        let mut event = Event {
+            op: self.op,
+            button: self.op.button(),
+            container: self.container,
+            payload: Wrapped::received(payload),
+            signatures: self.signatures.clone(),
+            covered: Vec::new(),
+            head: self.head.map(|h| ksg_container_v2::event::Head {
+                counter: h.counter,
+                page: h.page,
+            }),
+        };
+        event.covered = event.subject();
+        let evidence = match &self.evidence {
+            CommandEvidence::None => Evidence::None,
+            CommandEvidence::SharesLost { hash } => Evidence::SharesLost(*hash),
+            CommandEvidence::Dispute { filing } => Evidence::Dispute(filing.clone()),
+            CommandEvidence::AttachedTo { leader } => Evidence::Coupling(
+                ksg_core_v2::journal::CouplingRecord::AttachedTo { leader: *leader },
+            ),
+        };
+        Ok((event, evidence))
+    }
+
+    /// The bytes the signers sign and the anchor commits to (through their
+    /// hash): the event's subject.
+    ///
+    /// # Errors
+    ///
+    /// As [`CommandFile::event`].
+    pub fn subject(&self) -> Result<Vec<u8>, String> {
+        Ok(self.event()?.0.covered)
+    }
 }
 
 /// What owes the anchor an [`Answer::NeedsAnchor`] names.
@@ -428,6 +730,19 @@ enum PageToWrite {
     Record(RecordKind, Piece),
     /// The page of a change of form (E-10, CH-30).
     Form(Mode),
+    /// E-7: the page of the rule of two seals (`Body::Rule`, CH-19) —
+    /// `[р]` 31.10 «А».
+    Rule(ksg_core_v2::journal::SealRule),
+    /// A record of this kind whose page names its content type (E-8: the
+    /// ownership claim, `OWNERSHIP_CLAIM_PAGE`) — `[р]` 31.10 «А».
+    Typed(RecordKind, Piece, Uri),
+    /// E-9: the page of a change of owner, to the owner arriving with the
+    /// command (`Body::Transfer`, `OwnerChange`) — `[р]` 31.10 «А» С6/С7.
+    /// Pressed by [`Request::Transfer`].
+    OwnerChange(PublicKey),
+    /// E-14 slot 1 / E-5 slot 2: the page of the coupling of containers
+    /// (CH-12) — `[р]` 31.10 «ок А» (С10).
+    Coupling(ksg_core_v2::journal::CouplingRecord),
 }
 
 /// What a repeated command still owes the press (I6b): the offsets its
@@ -609,8 +924,23 @@ impl Session {
         let state_key = decode_32(&shared.state_key, "shared secrets: state key")?;
         let template =
             Hash::from_multihash(&shared.template).map_err(|e| format!("template: {e}"))?;
-        let container = Container::open_sealed(&state, &template, &state_key)
-            .map_err(|e| format!("the container does not open: {e}"))?;
+        // K2 (§26, Р-4): the halves come from the parties' own parts — the
+        // ones this session opened; an empty part (a capsule sealed before
+        // K2) leaves the half where it was, in the state.
+        let own = |kind: PartKind| {
+            parts
+                .iter()
+                .find(|p| p.kind == kind && !p.bytes.is_empty())
+                .map(|p| p.bytes.as_slice())
+        };
+        let container = Container::open_sealed_split(
+            &state,
+            &template,
+            &state_key,
+            own(PartKind::ClientSecrets),
+            own(PartKind::OwnerSecrets),
+        )
+        .map_err(|e| format!("the container does not open: {e}"))?;
 
         // The file names the container it belongs to: a side file for another
         // capsule is refused here rather than after a press.
@@ -643,6 +973,12 @@ impl Session {
             return Err(
                 "side file: the container is initiated, but the file carries no mobile half".into(),
             );
+        }
+        // A born container opened by its client holds its half — from the
+        // client's part or, before K2, from the state. Without it no page
+        // could be signed: refused here, not at the first `Work`.
+        if container.born() && side.role == SideRole::Client && !container.holds_client_half() {
+            return Err("the capsule carries no client's half: neither its part nor its state".into());
         }
         let owner = match side.role {
             SideRole::Owner => Some(open_owner(&container, &side.half)?),
@@ -708,6 +1044,9 @@ impl Session {
     /// | [`Request::Reanchor`] | the last owed anchor settled: `{"pages", "seal"}`, as the opening's |
     /// | [`Request::Sign`] | the same as the command whose signature was missing |
     pub fn call(&mut self, request: Request) -> Answer {
+        if let Some(answer) = self.followups_first(&request) {
+            return answer;
+        }
         match request {
             Request::Status => Answer::Done {
                 bytes: serde_json::to_vec(&self.status_json()).unwrap_or_default(),
@@ -721,6 +1060,10 @@ impl Session {
             Request::Reanchor { attestation } => self.reanchor(&attestation),
             Request::OpenJournal => self.open_journal(),
             Request::ApplyPacket => self.apply_packet(),
+            Request::ApplyPacketSeated { distributor } => self.apply_packet_seated(distributor),
+            Request::ApplyBuyerKey { buyer, holder_map } => {
+                self.apply_buyer_key(buyer, &holder_map)
+            }
             Request::SetMaps { maps } => self.set_maps(&maps),
             Request::Form { to } => self.form(to),
             Request::FullExport => self.full_export(),
@@ -730,6 +1073,7 @@ impl Session {
                 &Evidence::None,
                 PageToWrite::None,
             ),
+            Request::DeclareKeyLostByDistributor => self.declare_key_lost_by_distributor(),
             Request::Freeze => self.holder_op(
                 Operation::FreezeOnOwnerApplication,
                 &[Party::External(Role::Issuer), Party::Owner],
@@ -747,9 +1091,26 @@ impl Session {
                     Piece::Inline(hash.to_multihash().into_bytes()),
                 ),
             ),
+            Request::Attach { what } => self.attach(what),
+            Request::ApplyCommand { file, attestation } => self.apply_command(&file, &attestation),
+            Request::PendingTasks => self.pending_tasks(),
+            Request::WriteLayer { index, sealed } => self.write_layer(index, sealed),
+            Request::HandedOver { index, sealed } => self.handed_over(index, sealed),
+            Request::Transfer { new_owner, owner_map } => self.transfer(new_owner, &owner_map),
             Request::Sign { signature } => self.sign_pending(&signature),
+            Request::AppointExpert { entry } => self.appoint_expert(&entry),
+            Request::Disclose {
+                entry,
+                expert_record,
+                record_anchor,
+                disclosure,
+            } => self.disclose_to_expert(entry, expert_record, record_anchor, disclosure),
             Request::ClientCommit { commitment } => self.client_commit(&commitment),
             Request::ClientShare { share } => self.client_share(&share),
+            Request::Pull { trailer, trailer_seal } => self.pull(trailer, trailer_seal),
+            Request::FullExportVoluntary { opening, anchor } => {
+                self.full_export_voluntary(*opening, anchor)
+            }
         }
     }
 
@@ -799,14 +1160,35 @@ impl Session {
             ));
         }
         let mut rng = CspRng;
-        let state = self
-            .container
-            .seal_to_bytes(self.state_key.bytes(), &mut rng)
-            .map_err(|e| format!("the state does not seal: {e}"))?;
-        let mut fill = |out: &mut [u8]| rng.fill_bytes(out);
         // Two maps (§21, 4б.4а): v2 — the other party's private part rides
         // through unopened. One map: as before.
         if self.maps.len() > 1 {
+            // K2 (§26, Р-4): each half goes to its party's part when this
+            // session writes that part (it opened it, or the capsule has none);
+            // a part riding through sealed keeps its half in the state, as
+            // before K2 — never lost.
+            let writes = |kind: PartKind| !self.carried.iter().any(|c| c.kind == kind);
+            let (to_client, to_owner) =
+                (writes(PartKind::ClientSecrets), writes(PartKind::OwnerSecrets));
+            let (state, secrets) = self
+                .container
+                .seal_to_bytes_split(self.state_key.bytes(), to_client, to_owner, &mut rng)
+                .map_err(|e| format!("the state does not seal: {e}"))?;
+            let mut parts = self.parts.clone();
+            for (kind, write, bytes) in [
+                (PartKind::ClientSecrets, to_client, secrets.client.as_deref()),
+                (PartKind::OwnerSecrets, to_owner, secrets.former.as_deref()),
+            ] {
+                if !write {
+                    continue;
+                }
+                let bytes = bytes.cloned().unwrap_or_default();
+                match parts.iter_mut().find(|p| p.kind == kind) {
+                    Some(p) => p.bytes = bytes,
+                    None => parts.push(Part { kind, bytes }),
+                }
+            }
+            let mut fill = |out: &mut [u8]| rng.fill_bytes(out);
             let capsule = capsule::seal_into_capsule_split(
                 &state,
                 self.state_key.bytes(),
@@ -816,7 +1198,7 @@ impl Session {
                 self.issued_ms,
                 self.clock_ms,
                 &self.code,
-                &self.parts,
+                &parts,
                 &self.carried,
                 &self.maps,
                 &mut fill,
@@ -824,6 +1206,11 @@ impl Session {
             .map_err(|e| format!("the capsule does not assemble: {e}"))?;
             return Ok((capsule, self.outputs.clone()));
         }
+        let state = self
+            .container
+            .seal_to_bytes(self.state_key.bytes(), &mut rng)
+            .map_err(|e| format!("the state does not seal: {e}"))?;
+        let mut fill = |out: &mut [u8]| rng.fill_bytes(out);
         let capsule = seal_parts(
             &state,
             &self.state_key,
@@ -844,11 +1231,18 @@ impl Session {
     fn status_json(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.container.id().to_multihash(),
+            // K3 (§27): the head a network command must name.
+            "head": self.container.head().map(|h| serde_json::json!({
+                "counter": h.counter,
+                "page": h.page.to_multihash(),
+            })),
             "template": self.template.to_multihash(),
             "class": format!("{:?}", self.container.class()),
             "status": format!("{:?}", self.container.status()),
             "pages": self.container.pages(),
             "top_seal": self.container.top_seal_hash().map(|h| h.to_multihash()),
+            // C9: what a `light` anchors on Base when there is no seal yet.
+            "status_head": self.container.status_head().to_multihash(),
             "form": self.container.form().map(|f| format!("{f:?}")),
             "pending": self.container.pending().len(),
             "born": self.container.born(),
@@ -1860,6 +2254,259 @@ impl Session {
         Err(self.missing(Party::External(role), msg))
     }
 
+    /// K4 (§28, full ladder fix 1): while a follow-up that holds the container
+    /// up is open — a release or packet layer to write, a layer key to hand
+    /// over — a request that would move the status is refused. A move would
+    /// make the follow-up stale for good (`Container::claim` wants the head it
+    /// was raised at), and with it the initiation or the journal blocked for
+    /// good. The chain layer (E-9) holds nothing up and is not guarded. On the
+    /// paths before K4 no such follow-up is ever open (the stand discharges
+    /// them at printing), so nothing there changes.
+    fn followups_first(&self, request: &Request) -> Option<Answer> {
+        use ksg_container_v2::{Task, Zone};
+        let holds_up = self.container.pending().iter().any(|r| {
+            matches!(
+                r.task,
+                Task::WriteLayer { zone: Zone::Release | Zone::Packet } | Task::HandOverLayer { .. }
+            )
+        });
+        if !holds_up {
+            return None;
+        }
+        let allowed = matches!(
+            request,
+            Request::Status
+                | Request::Keys
+                | Request::PendingTasks
+                | Request::WriteLayer { .. }
+                | Request::HandedOver { .. }
+                | Request::Reanchor { .. }
+                | Request::Sign { .. }
+                | Request::ClientCommit { .. }
+                | Request::ClientShare { .. }
+        );
+        (!allowed).then(|| Answer::Refused {
+            reason: "the layers come first (K4): discharge the open follow-ups — PendingTasks, \
+                     then WriteLayer / HandedOver — before the next command"
+                .into(),
+        })
+    }
+
+    /// K4 (§28): the open follow-ups, one JSON object each.
+    fn pending_tasks(&self) -> Answer {
+        use ksg_container_v2::Task;
+        let mut out = Vec::new();
+        for (index, raised) in self.container.pending().iter().enumerate() {
+            out.push(match &raised.task {
+                Task::WriteLayer { zone } => {
+                    let position = (0..ksg_container_v2::layout::ZONE_POSITIONS)
+                        .map_while(|nth| ksg_container_v2::layout::zone_position(*zone, nth).ok())
+                        .find(|p| !self.container.sealed_zone_written(*p));
+                    let owner = (*zone == ksg_container_v2::Zone::Chain)
+                        .then(|| self.container.roster().holder(Role::Owner).cloned())
+                        .flatten();
+                    serde_json::json!({
+                        "index": index,
+                        "task": "write_layer",
+                        "zone": zone,
+                        "position": position,
+                        "owner": owner,
+                    })
+                }
+                Task::HandOverLayer { to, up_to } => serde_json::json!({
+                    "index": index,
+                    "task": "hand_over",
+                    "to": to,
+                    "up_to": up_to.0,
+                }),
+                Task::CarryId { .. } => serde_json::json!({ "index": index, "task": "carry_id" }),
+            });
+        }
+        Answer::Done {
+            bytes: serde_json::Value::Array(out).to_string().into_bytes(),
+        }
+    }
+
+    /// K4: writes the issuer's sealed zone for the follow-up `index` and
+    /// discharges it.
+    fn write_layer(&mut self, index: usize, sealed: Vec<u8>) -> Answer {
+        use ksg_container_v2::{Discharge, Proof, Task};
+        let refused = |reason: String| Answer::Refused { reason };
+        let zone = match self.container.pending().get(index).map(|r| &r.task) {
+            Some(Task::WriteLayer { zone }) => *zone,
+            _ => return refused(format!("follow-up {index} is not a layer to write")),
+        };
+        if !self.container.zones_laid() {
+            let mut noise = zeroize::Zeroizing::new(vec![
+                0u8;
+                ksg_container_v2::layout::ZONE_POSITIONS
+                    * ksg_container_v2::layout::ZONE_BYTES
+            ]);
+            CspRng.fill_bytes(&mut noise);
+            if let Err(e) = self.container.lay_zone_noise(&noise) {
+                return refused(format!("the zones' noise: {e}"));
+            }
+        }
+        let ticket = match self.container.claim(index) {
+            Ok(t) => t,
+            Err(e) => return refused(format!("the follow-up: {e}")),
+        };
+        let digest = Hash::sha256(&sealed);
+        if let Err(e) = self.container.write_zone(zone, sealed) {
+            return refused(format!("the zone: {e}"));
+        }
+        match self.container.discharge(&Discharge {
+            ticket,
+            proof: Proof::LayerWritten { zone, digest },
+        }) {
+            Ok(()) => Answer::Done {
+                bytes: self.status_json().to_string().into_bytes(),
+            },
+            Err(e) => refused(format!("the discharge: {e}")),
+        }
+    }
+
+    /// K4: discharges the hand-over of the layer key made outside.
+    fn handed_over(&mut self, index: usize, sealed: Hash) -> Answer {
+        use ksg_container_v2::{Discharge, Proof, Task};
+        let refused = |reason: String| Answer::Refused { reason };
+        let (to, up_to) = match self.container.pending().get(index).map(|r| &r.task) {
+            Some(Task::HandOverLayer { to, up_to }) => (to.clone(), *up_to),
+            _ => return refused(format!("follow-up {index} is not a hand-over")),
+        };
+        let ticket = match self.container.claim(index) {
+            Ok(t) => t,
+            Err(e) => return refused(format!("the follow-up: {e}")),
+        };
+        match self.container.discharge(&Discharge {
+            ticket,
+            proof: Proof::HandedOver { to, up_to, sealed },
+        }) {
+            Ok(()) => Answer::Done {
+                bytes: self.status_json().to_string().into_bytes(),
+            },
+            Err(e) => refused(format!("the discharge: {e}")),
+        }
+    }
+
+    /// K3 (§27): a command from the network, pressed with the signatures it
+    /// came with. Its anchor must name exactly the bytes those signatures
+    /// cover; a replay carries a stale head and the container refuses it.
+    fn apply_command(&mut self, command: &[u8], attestation: &[u8]) -> Answer {
+        let refused = |reason: String| Answer::Refused { reason };
+        let file: CommandFile = match serde_json::from_slice(command) {
+            Ok(f) => f,
+            Err(e) => return refused(format!("the command does not read: {e}")),
+        };
+        if !COMMAND_OPS.contains(&file.op) {
+            return refused(format!(
+                "{:?} does not come from the network (K3: Finalize, ServeDispute, DeclareSharesLost)",
+                file.op
+            ));
+        }
+        let (event, evidence) = match file.event() {
+            Ok(e) => e,
+            Err(e) => return refused(e),
+        };
+        if event.container != *self.container.id() {
+            return refused("the command is another container's".into());
+        }
+        let attestation: Attestation = match serde_json::from_slice(attestation) {
+            Ok(a) => a,
+            Err(e) => return refused(format!("the attestation does not read: {e}")),
+        };
+        if attestation.subject != Hash::sha256(&event.covered) {
+            return refused("the anchor names other bytes than the command's signatures cover".into());
+        }
+        let page = match &evidence {
+            // The declaration's digest is the page, as the owner's E-24 (C1).
+            Evidence::SharesLost(hash) => PageToWrite::Record(
+                RecordKind::SharesDeclaredLost,
+                Piece::Inline(hash.to_multihash().into_bytes()),
+            ),
+            // E-14 writes slot 1 of the coupling when the journal is open
+            // (the kernel's `Operation::Succeed => journal_open && ...`):
+            // without a journal the succession moves the status but writes
+            // no page. A closed journal never reaches here, but the branch
+            // is read against `self.container.head()` so the shape stays
+            // explicit even where it is unreachable.
+            Evidence::Coupling(c) if self.container.head().is_some() => {
+                PageToWrite::Coupling(c.clone())
+            }
+            _ => PageToWrite::None,
+        };
+        match self.press_presigned(&event, &evidence, page) {
+            Ok(()) => Answer::Done {
+                bytes: self.status_json().to_string().into_bytes(),
+            },
+            Err(answer) => answer,
+        }
+    }
+
+    /// [`Session::press`] for an event signed outside — the network's command
+    /// (K3): its page, the status record signed by this session's party, the
+    /// container's press and what Pro owes the network. `press` itself is not
+    /// changed (HIGH); this is its tail without the signing.
+    fn press_presigned(
+        &mut self,
+        event: &Event,
+        evidence: &Evidence,
+        page: PageToWrite,
+    ) -> Result<(), Answer> {
+        let (page, page_need) = match self.opening_page_or(page) {
+            Ok(w) => w,
+            Err(needs) => {
+                if !Self::is_wait_answer(&needs) {
+                    self.press_offsets = PressOffsets::default();
+                }
+                return Err(needs);
+            }
+        };
+        let (status, status_need) = match self.status_record(event.op) {
+            Ok(w) => w,
+            Err(needs) => {
+                if !Self::is_wait_answer(&needs) {
+                    self.press_offsets = PressOffsets::default();
+                }
+                return Err(needs);
+            }
+        };
+        let keys = self.container.roster().keys().clone();
+        let at_ms = Some(self.clock_ms);
+        self.container
+            .press(
+                event,
+                evidence,
+                Writes {
+                    page,
+                    status,
+                    at_ms,
+                },
+                &keys,
+                &Profile::default(),
+            )
+            .map_err(|e| Answer::Refused {
+                reason: format!("refused: {e}"),
+            })?;
+        self.press_offsets = PressOffsets::default();
+        self.pending_client_sigs.clear();
+        if !self.pending_opening {
+            self.pending_open_offset = None;
+        }
+        if self.container.is_pro() {
+            if let Some(need) = page_need {
+                self.pending_anchors.push_back(need);
+            }
+            if let Some(need) = status_need {
+                self.pending_anchors.push_back(need);
+            }
+            if let Some(head) = self.pending_anchors.front() {
+                return Err(head.answer());
+            }
+        }
+        Ok(())
+    }
+
     /// E-2 through the session (§19): the issuer's press on the holder's map,
     /// before initiation; `bare` has no packet.
     fn apply_packet(&mut self) -> Answer {
@@ -1878,6 +2525,68 @@ impl Session {
                 bytes: self.status_json().to_string().into_bytes(),
             },
             Err(answer) => answer,
+        }
+    }
+
+    /// E-2 with a seat (§19): the distributor is seated before the press and
+    /// stays seated if the press is refused or waits for a signature.
+    fn apply_packet_seated(&mut self, distributor: PublicKey) -> Answer {
+        if self.container.roster().holder(Role::Distributor) != Some(&distributor) {
+            if let Err(e) = self.container.seat_distributor(distributor) {
+                return Answer::Refused {
+                    reason: format!("the distributor is not seated: {e}"),
+                };
+            }
+        }
+        self.apply_packet()
+    }
+
+    /// E-3 (§19): the buyer's key and the owner's consent; then the buyer's
+    /// map replaces the holder's (one map before the birth).
+    fn apply_buyer_key(&mut self, buyer: PublicKey, holder_map: &capsule::MapPub) -> Answer {
+        self.awaiting_owner = None;
+        if self.container.born() {
+            return Answer::Refused {
+                reason: "the container is initiated: the buyer's key is before E-4".into(),
+            };
+        }
+        if self.maps.len() != 1 {
+            return Answer::Refused {
+                reason: "the capsule carries the parties' maps already".into(),
+            };
+        }
+        let (role, seal) = match map_from(holder_map) {
+            Ok(m) => m,
+            Err(reason) => return Answer::Refused { reason },
+        };
+        if role != self.maps[0].0 {
+            return Answer::Refused {
+                reason: "the buyer's map takes the holder's slot: its role is the holder's".into(),
+            };
+        }
+        let result = self.press(
+            Operation::ApplyBuyerKey,
+            &[Party::External(Role::Buyer), Party::Owner],
+            &Evidence::KeyLaid {
+                to: buyer,
+                up_to: Level(2),
+            },
+            PageToWrite::None,
+        );
+        match result {
+            Ok(()) => {
+                self.maps[0].1 = seal;
+                Answer::Done {
+                    bytes: self.status_json().to_string().into_bytes(),
+                }
+            }
+            // The press is made; the network owes an anchor (Pro): the map
+            // changes all the same, the capsule closes sealed to the buyer.
+            Err(answer @ Answer::NeedsAnchor { .. }) => {
+                self.maps[0].1 = seal;
+                answer
+            }
+            Err(answer) => self.note_owner_wait(answer),
         }
     }
 
@@ -1922,6 +2631,91 @@ impl Session {
         }
     }
 
+    /// E-15 with the distributor (`Spec_kapsula` §24): `Keys::AnyOf` takes
+    /// `[Distributor, Client]`. Like the stand's `declare_dead`, the seat is
+    /// checked before the press, so nobody is asked to sign for a road that
+    /// does not exist.
+    fn declare_key_lost_by_distributor(&mut self) -> Answer {
+        if self.container.roster().holder(Role::Distributor).is_none() {
+            self.awaiting_owner = None;
+            return Answer::Refused {
+                reason: "no distributor is seated in this container: the packet was sold \
+                         directly by the issuer"
+                    .into(),
+            };
+        }
+        self.holder_op(
+            Operation::DeclareKeyLost,
+            &[Party::External(Role::Distributor), Party::Client],
+            &Evidence::None,
+            PageToWrite::None,
+        )
+    }
+
+    /// E-9 through the session (`Spec_kapsula` §21): the owner and the
+    /// arriving owner sign, the journal takes the page of the change of owner,
+    /// and the owner's slot is sealed to the arriving owner's map from then
+    /// on. Nothing changes if the press does not go in.
+    fn transfer(&mut self, new_owner: PublicKey, owner_map: &capsule::MapPub) -> Answer {
+        self.awaiting_owner = None;
+        let seal = match map_from(owner_map) {
+            Ok((MapRole::Owner, seal)) => seal,
+            Ok(_) => {
+                return Answer::Refused {
+                    reason: "the arriving owner's map takes the owner's slot: its role is the owner's"
+                        .into(),
+                }
+            }
+            Err(reason) => return Answer::Refused { reason },
+        };
+        let Some(slot) = self.maps.iter().position(|(r, _)| *r == MapRole::Owner) else {
+            return Answer::Refused {
+                reason: "the capsule carries no owner's map: the owner's map comes with E-4".into(),
+            };
+        };
+        // The former owner's secrets, sealed to his map, ride through this
+        // session unopened. Empty — they are made again under the new map at
+        // close; not empty — only the former owner's session can move them.
+        let rides = self.carried.iter().position(|c| c.kind == PartKind::OwnerSecrets);
+        if let Some(i) = rides {
+            if self.carried[i].blob.len() > EMPTY_PRIVATE_PART {
+                return Answer::Refused {
+                    reason: "the former owner's secrets need his own session: they ride sealed                              to his map and would not open for the new owner"
+                        .into(),
+                };
+            }
+        }
+        let result = self.press(
+            Operation::TransferOwnership,
+            &[Party::Owner, Party::External(Role::Buyer)],
+            &Evidence::Transfer(new_owner.clone()),
+            PageToWrite::OwnerChange(new_owner),
+        );
+        match result {
+            Ok(()) => {}
+            // The press is made; the network owes an anchor (Pro): the map
+            // changes all the same, the capsule closes sealed to the new owner.
+            Err(answer @ Answer::NeedsAnchor { .. }) => {
+                self.moved_to_owner(slot, seal, rides);
+                return answer;
+            }
+            Err(answer) => return self.note_owner_wait(answer),
+        }
+        self.moved_to_owner(slot, seal, rides);
+        Answer::Done {
+            bytes: self.status_json().to_string().into_bytes(),
+        }
+    }
+
+    /// The seat and the slot of the owner have moved: seal to the new map and
+    /// let go of the empty secrets part sealed to the former one.
+    fn moved_to_owner(&mut self, slot: usize, seal: SealTo, rides: Option<usize>) {
+        self.maps[slot].1 = seal;
+        if let Some(i) = rides {
+            self.carried.remove(i);
+        }
+    }
+
     /// E-10 through the session: the form changes, the journal takes a page of
     /// it. Pro (up) takes the issuer beside the owner, light (down) the owner
     /// alone.
@@ -1944,6 +2738,106 @@ impl Session {
         }
     }
 
+    /// E-6 through the session: the client signs, the page is the content's
+    /// digest; in Pro the journal asks the owner's seal on it, and it comes
+    /// in as for [`Session::form`].
+    fn attach(&mut self, what: AttachWire) -> Answer {
+        let (name, mime, content_hash, size, offset_ms, derived_from) = match what {
+            AttachWire::Artifact {
+                name,
+                mime,
+                content_hash,
+                size,
+                offset_ms,
+                derived_from,
+            } => (name, mime, content_hash, size, offset_ms, derived_from),
+            AttachWire::Rule { rule } => {
+                return self.holder_op(
+                    Operation::AttachArtifactOrRights,
+                    &[Party::Client],
+                    &Evidence::Rule(rule.clone()),
+                    PageToWrite::Rule(rule),
+                )
+            }
+            AttachWire::Claim {
+                artifact,
+                open_id,
+                agent,
+                signatures,
+                anchor,
+            } => return self.attach_claim(artifact, open_id, agent, signatures, anchor),
+        };
+        let mut derived = Vec::with_capacity(derived_from.len());
+        for uri in derived_from {
+            match Uri::parse(uri) {
+                Ok(u) => derived.push(u),
+                Err(e) => {
+                    return Answer::Refused {
+                        reason: format!("derived_from does not read as a URI: {e}"),
+                    }
+                }
+            }
+        }
+        let attachment = Attachment {
+            artifact: self.artifact.clone(),
+            kind: Kind::Media { mime },
+            content_hash,
+            size,
+            name,
+            derived_from: derived,
+            offset_ms,
+        };
+        self.holder_op(
+            Operation::AttachArtifactOrRights,
+            &[Party::Client],
+            &Evidence::Artifact(Box::new(attachment)),
+            PageToWrite::Record(RecordKind::ArtifactOrRights, Piece::Digest(content_hash)),
+        )
+    }
+
+    /// E-8 through the session: the claim's two hashes on a page of its own
+    /// type; the container checks the publication (as the stand's `claim`).
+    fn attach_claim(
+        &mut self,
+        artifact: Hash,
+        open_id: String,
+        agent: PublicKey,
+        signatures: SignatureSet,
+        anchor: Attestation,
+    ) -> Answer {
+        use ksg_container_v2::identity::{id_hash, OwnershipClaim, Publication, OWNERSHIP_CLAIM_PAGE};
+        let claim = OwnershipClaim {
+            container: *self.container.id(),
+            artifact,
+            agent_id: id_hash(&open_id),
+        };
+        let publication = Publication {
+            container: *self.container.id(),
+            open_id,
+            agent,
+            signatures,
+            anchor,
+        };
+        let content_type = match Uri::parse(OWNERSHIP_CLAIM_PAGE.to_owned()) {
+            Ok(u) => u,
+            Err(e) => return Answer::Refused { reason: format!("page type: {e}") },
+        };
+        let page = PageToWrite::Typed(
+            RecordKind::ArtifactOrRights,
+            Piece::Inline(claim.page_bytes()),
+            content_type,
+        );
+        self.holder_op(
+            Operation::AttachArtifactOrRights,
+            &[Party::Client],
+            &Evidence::Claim {
+                claim: Box::new(claim),
+                publication: Box::new(publication),
+            },
+            page,
+        )
+    }
+
     /// `FullExport`: the owner and the client export everything and the
     /// container dies. The export goes to `outputs`, as a page does.
     fn full_export(&mut self) -> Answer {
@@ -1952,6 +2846,45 @@ impl Session {
             Operation::FullExport,
             &[Party::Owner, Party::Client],
             &Evidence::Unload(Box::new(UnloadRoute::Principals)),
+            PageToWrite::None,
+        ) {
+            return self.note_owner_wait(answer);
+        }
+        let Some(export) = self.container.take_export() else {
+            return Answer::Refused {
+                reason: "no export handed out".into(),
+            };
+        };
+        match serde_json::to_vec(&export) {
+            Ok(bytes) => {
+                self.outputs.push(bytes.clone());
+                Answer::Done { bytes }
+            }
+            Err(e) => Answer::Refused {
+                reason: format!("the export does not serialize: {e}"),
+            },
+        }
+    }
+
+    /// `FullExport` by the road of a voluntary opening (st.12): the owner
+    /// and the client export everything and the container dies. Like
+    /// [`Session::full_export`], but the evidence carries the opening the
+    /// four parties signed and its declaration's anchor — the gate checks
+    /// them (`Route::Voluntary`). The export goes to `outputs`, as a page
+    /// does.
+    fn full_export_voluntary(
+        &mut self,
+        opening: ksg_container_v2::voluntary::VoluntaryOpening,
+        anchor: Attestation,
+    ) -> Answer {
+        self.awaiting_owner = None;
+        if let Err(answer) = self.press(
+            Operation::FullExport,
+            &[Party::Owner, Party::Client],
+            &Evidence::Unload(Box::new(UnloadRoute::Voluntary {
+                opening: Box::new(opening),
+                anchor,
+            })),
             PageToWrite::None,
         ) {
             return self.note_owner_wait(answer);
@@ -1983,6 +2916,19 @@ impl Session {
         answer
     }
 
+    /// E-5 slot 2 of the coupling (CH-12): the leading container pulls the
+    /// trailer; its last seal comes with it. As the stand's `pull`: the
+    /// client's `RecordWork` with the coupling page.
+    fn pull(&mut self, trailer: Hash, trailer_seal: Hash) -> Answer {
+        let coupling = ksg_core_v2::journal::CouplingRecord::Pulls { trailer, trailer_seal };
+        self.holder_op(
+            Operation::RecordWork,
+            &[Party::Client],
+            &Evidence::Coupling(coupling.clone()),
+            PageToWrite::Coupling(coupling),
+        )
+    }
+
     /// The page of a change of form, sealed the way its parties do (CH-29).
     fn form_page(
         &mut self,
@@ -2002,6 +2948,110 @@ impl Session {
         let draft = self
             .container
             .draft_form(to, offset_ms)
+            .map_err(|e| Answer::Refused {
+                reason: format!("the page is not drafted: {e}"),
+            })?;
+        self.seal_draft(draft).map(|(w, n)| (Some(w), n))
+    }
+
+    /// The offset a page is drafted with: a repeated command reuses the one
+    /// its open press ticked (I6b), as [`Session::form_page`] does.
+    fn page_offset(&mut self) -> u64 {
+        if let Some(ticked) = self.press_offsets.page_offsets.pop() {
+            self.press_offsets.page_offsets.push(ticked);
+            return ticked;
+        }
+        let ticked = self.tick();
+        self.press_offsets.page_offsets.push(ticked);
+        ticked
+    }
+
+    /// E-7: the page of the rule of two seals (`[р]` 31.10 «А»).
+    fn rule_page(
+        &mut self,
+        rule: ksg_core_v2::journal::SealRule,
+    ) -> Result<(Option<JournalWrite>, Option<AnchorNeed>), Answer> {
+        let offset_ms = self.page_offset();
+        let draft = self
+            .container
+            .draft_rule(rule, offset_ms)
+            .map_err(|e| Answer::Refused {
+                reason: format!("the page is not drafted: {e}"),
+            })?;
+        self.seal_draft(draft).map(|(w, n)| (Some(w), n))
+    }
+
+    /// E-9: the page of a change of owner to `to` (`[р]` 31.10 «А» С6/С7).
+    fn owner_change_page(
+        &mut self,
+        to: &PublicKey,
+    ) -> Result<(Option<JournalWrite>, Option<AnchorNeed>), Answer> {
+        let offset_ms = self.page_offset();
+        let draft = self
+            .container
+            .draft_owner_change_to_key(to, offset_ms)
+            .map_err(|e| Answer::Refused {
+                reason: format!("the page is not drafted: {e}"),
+            })?;
+        let transfer_bytes = draft.transfer_bytes().map_err(|e| Answer::Refused {
+            reason: format!("the transfer seal does not encode: {e}"),
+        })?;
+        let (mut write, need) = self.seal_draft(draft)?;
+        if let Some(bytes) = transfer_bytes {
+            self.sign_transfer_seal(&mut write, &bytes)?;
+        }
+        Ok((Some(write), need))
+    }
+
+    /// The transfer seal of a change of owner (`journal::check_transfer_seal`):
+    /// the agent through both halves, the owner, and the arriving owner —
+    /// who signs from outside as the buyer — over the transfer seal's bytes,
+    /// as the stand's `seal_draft` does. Any of them may be missing: the
+    /// answer asks for it and the repeat finds it.
+    fn sign_transfer_seal(&mut self, write: &mut JournalWrite, bytes: &[u8]) -> Result<(), Answer> {
+        let mut sigs = self.sign_client(bytes)?;
+        sigs.push(self.sign_owner(bytes)?);
+        sigs.push(self.sign_external(bytes, Role::Buyer)?);
+        if let JournalWrite::Record { sealing, .. } = write {
+            sealing.transfer = Some(SignatureSet::new(sigs));
+        }
+        Ok(())
+    }
+
+    /// The page of a coupling (CH-12; `[р]` 31.10 «ок А», С10).
+    fn coupling_page(
+        &mut self,
+        record: ksg_core_v2::journal::CouplingRecord,
+    ) -> Result<(Option<JournalWrite>, Option<AnchorNeed>), Answer> {
+        let offset_ms = self.page_offset();
+        let draft = self
+            .container
+            .draft_coupling(record, offset_ms)
+            .map_err(|e| Answer::Refused {
+                reason: format!("the page is not drafted: {e}"),
+            })?;
+        self.seal_draft(draft).map(|(w, n)| (Some(w), n))
+    }
+
+    /// A record whose page names its content type (E-8; `[р]` 31.10 «А»).
+    fn typed_page(
+        &mut self,
+        kind: RecordKind,
+        content: Piece,
+        content_type: Uri,
+    ) -> Result<(Option<JournalWrite>, Option<AnchorNeed>), Answer> {
+        let offset_ms = self.page_offset();
+        let draft = self
+            .container
+            .draft_record(
+                vec![content],
+                RecordMeta {
+                    kind,
+                    content_type: Some(content_type),
+                    ..RecordMeta::default()
+                },
+                offset_ms,
+            )
             .map_err(|e| Answer::Refused {
                 reason: format!("the page is not drafted: {e}"),
             })?;
@@ -2164,6 +3214,12 @@ impl Session {
             }
             PageToWrite::Record(kind, content) => (kind, content),
             PageToWrite::Form(to) => return self.form_page(to),
+            PageToWrite::Rule(rule) => return self.rule_page(rule),
+            PageToWrite::Typed(kind, content, content_type) => {
+                return self.typed_page(kind, content, content_type)
+            }
+            PageToWrite::OwnerChange(to) => return self.owner_change_page(&to),
+            PageToWrite::Coupling(record) => return self.coupling_page(record),
         };
         // A repeated command reuses the offsets its open press ticked (I6b):
         // the draft — and the seal bytes the wire round signs — stays the
@@ -2358,6 +3414,87 @@ fn seal_parts(
         fill,
     )
     .map_err(|e| format!("the capsule does not assemble: {e}"))
+}
+
+/// The expert's road through the session (`Spec_kapsula` §23, C7).
+impl Session {
+    /// `AppointExpert`: one page naming the expert, through the existing
+    /// typed page (`PageToWrite::Typed`) — the core wants a `Body::Content`
+    /// of type `EXPERT_ENTRY_PAGE` carrying the entry's digest.
+    fn appoint_expert(&mut self, entry: &ExpertEntry) -> Answer {
+        self.awaiting_owner = None;
+        // The side that is here signs: the client where the mobile half is,
+        // else the owner (the same choice as `export_page`).
+        // A wire session holds no half either: its client's round comes over
+        // the wire.
+        let party = if self.mobile.is_none() && self.owner.is_some() {
+            Party::Owner
+        } else {
+            Party::Client
+        };
+        let content_type = match Uri::parse(EXPERT_ENTRY_PAGE.to_owned()) {
+            Ok(u) => u,
+            Err(e) => return Answer::Refused { reason: format!("page type: {e}") },
+        };
+        let pieces = match entry_pieces(entry) {
+            Ok(p) => p,
+            Err(e) => {
+                return Answer::Refused {
+                    reason: format!("the entry does not encode: {e:?}"),
+                }
+            }
+        };
+        let [digest, _] = pieces;
+        // `Work`: the kind the core's check admits here (it asks no owner's
+        // seal in Pro, as the stand's `name_in_journal`).
+        let page = PageToWrite::Typed(RecordKind::Work, digest, content_type);
+        self.holder_op(
+            Operation::AppointExpert,
+            &[party],
+            &Evidence::ExpertNamed(Box::new(entry.clone())),
+            page,
+        )
+    }
+
+    /// `DiscloseToExpert`: the client and the owner; the pages the container
+    /// hands out go to `outputs`.
+    fn disclose_to_expert(
+        &mut self,
+        entry: Box<ExpertEntry>,
+        record: Box<ExpertRecord>,
+        record_anchor: Box<Attestation>,
+        disclosure: Box<ExpertDisclosure>,
+    ) -> Answer {
+        self.awaiting_owner = None;
+        let evidence = Evidence::Disclose {
+            entry,
+            record,
+            record_anchor,
+            disclosure,
+        };
+        if let Err(answer) = self.press(
+            Operation::DiscloseToExpert,
+            &[Party::Client, Party::Owner],
+            &evidence,
+            PageToWrite::None,
+        ) {
+            return self.note_owner_wait(answer);
+        }
+        let Some(pages) = self.container.take_disclosure() else {
+            return Answer::Refused {
+                reason: "no pages handed out".into(),
+            };
+        };
+        match serde_json::to_vec(&pages) {
+            Ok(bytes) => {
+                self.outputs.push(bytes.clone());
+                Answer::Done { bytes }
+            }
+            Err(e) => Answer::Refused {
+                reason: format!("the disclosure does not serialize: {e}"),
+            },
+        }
+    }
 }
 
 impl Drop for Session {

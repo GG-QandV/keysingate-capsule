@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine as _;
 use ksg_capsule_module::session::{AnchorKind, Answer, Request};
-use ksg_cli_v2::home::{kid, owner_seed, Seeds};
+use ksg_cli_v2::home::{kid, owner_seed, Parties, Seeds};
 use ksg_cli_v2::mobile::Mobile as _;
 use ksg_cli_v2::InitOptions;
 use ksg_container_v2::client_key::{
@@ -150,6 +150,9 @@ pub struct Print {
     pub anchor: Option<ksg_cli_v2::anchoring::AnchorCfg>,
     /// The module's bytes: the code part of the capsule.
     pub wasm: PathBuf,
+    /// Where a `light` capsule anchors on Base Sepolia (`init --base`,
+    /// `Spec_kapsula` §22, С9); `None` — no anchors on Base.
+    pub base: Option<crate::base::BaseSpec>,
 }
 
 impl Default for Print {
@@ -161,6 +164,7 @@ impl Default for Print {
             artifact: "ksg:artifact:the-one".into(),
             anchor: None,
             wasm: default_wasm(),
+            base: None,
         }
     }
 }
@@ -191,6 +195,9 @@ pub fn default_wasm() -> PathBuf {
 /// The stand refuses to print, the module is missing, or the capsule does not
 /// assemble.
 pub fn init(layout: &Layout, print: &Print) -> Result<String, String> {
+    if print.base.is_some() && print.class != Class::Light {
+        return Err("--base: only a `light` capsule anchors on Base Sepolia".into());
+    }
     std::fs::create_dir_all(&layout.home).map_err(|e| format!("{}: {e}", layout.home.display()))?;
     if layout.capsule().exists() {
         return Err(format!(
@@ -238,7 +245,12 @@ pub fn init(layout: &Layout, print: &Print) -> Result<String, String> {
     // placeholder the seal path never trusts before initiation (flow.rs:232 was
     // the stand's copy, `O-5 A`: the issuer has no access to it).
     let scan = fresh_scan_seed();
-    let client = SideFile::new(Role::Client, &meta.id, &[], &map, &scan);
+    // K3 (§27, `[р]` 31.10 «Б»): the command key — the issuer's, born here,
+    // kept at the stand and given to both parties.
+    let cmd = fresh_scan_seed();
+    crate::command::write_secret(&layout.stand().join("cmd.key"), &cmd)?;
+    let mut client = SideFile::new(Role::Client, &meta.id, &[], &map, &scan);
+    client.cmd = B64.encode(cmd);
     client.write(&layout.client_side())?;
     let seeds: Seeds = serde_json::from_slice(
         &std::fs::read(layout.stand().join("parties.json")).map_err(|e| format!("parties.json: {e}"))?,
@@ -247,10 +259,14 @@ pub fn init(layout: &Layout, print: &Print) -> Result<String, String> {
     let owner = Zeroizing::new(*owner_seed(&seeds)?);
     // I26: the owner's scan key is born at the recipient's — its own seed
     // from the process's CSPRNG at handover, never the stand's copy.
-    let owner_file = SideFile::new(Role::Owner, &meta.id, owner.as_slice(), &map, &fresh_scan_seed());
+    let mut owner_file = SideFile::new(Role::Owner, &meta.id, owner.as_slice(), &map, &fresh_scan_seed());
+    owner_file.cmd = B64.encode(cmd);
     owner_file.write(&layout.owner_side())?;
     if let Some(anchor) = &print.anchor {
         save_anchor(layout, anchor)?;
+    }
+    if let Some(base) = &print.base {
+        crate::base::BaseFile::create(layout, base)?;
     }
     Ok(meta.id)
 }
@@ -308,7 +324,7 @@ pub fn save_anchor(layout: &Layout, cfg: &ksg_cli_v2::anchoring::AnchorCfg) -> R
 ///
 /// The container was printed without `--anchor`, the side file does not read,
 /// the memo does not go out, or the module refuses.
-fn anchor_and_reanchor(
+pub(crate) fn anchor_and_reanchor(
     layout: &Layout,
     session: &mut Session,
     mut answer: Answer,
@@ -351,7 +367,7 @@ fn anchor_and_reanchor(
 }
 
 /// Reads a side file and the capsule, and opens one session with them.
-fn open(layout: &Layout, party: Party) -> Result<Session, String> {
+pub(crate) fn open(layout: &Layout, party: Party) -> Result<Session, String> {
     let side = Zeroizing::new(
         std::fs::read(layout.side(party)).map_err(|e| format!("{}: {e}", layout.side(party).display()))?,
     );
@@ -398,7 +414,7 @@ fn done(answer: Answer) -> Result<Vec<u8>, String> {
 /// The commitment does not encode, the round does not open or does not sign
 /// what was asked for, or the mobile half answers nothing.
 /// Closes a session and writes the capsule back atomically.
-fn finish(layout: &Layout, session: Session) -> Result<Vec<Vec<u8>>, String> {
+pub(crate) fn finish(layout: &Layout, session: Session) -> Result<Vec<Vec<u8>>, String> {
     let (capsule, outputs) = session.close()?;
     write_capsule(&layout.capsule(), &capsule)?;
     Ok(outputs)
@@ -454,6 +470,7 @@ fn fresh_scan_seed() -> [u8; 32] {
 /// The capsule is initiated already, the owner's file is missing or is not the
 /// owner's, the mobile side refuses the container's answer, the module refuses.
 pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
+    let mut base = crate::base::Anchoring::begin(layout)?;
     let raw = Zeroizing::new(
         std::fs::read(layout.client_side())
             .map_err(|e| format!("{}: {e}", layout.client_side().display()))?,
@@ -526,6 +543,16 @@ pub fn initiate(layout: &Layout) -> Result<serde_json::Value, String> {
     file.write(&layout.client_side())?;
     write_maps(layout, &maps)?;
     warn_backup_stale();
+    // Ya-2 (`Spec_kapsula` §22, С9): the client's key is on — anchored at
+    // once on Base if the network is there; if not, the next record waits
+    // for it. The capsule is written already: an anchor never outruns it.
+    if let Some(b) = base.as_mut() {
+        let mut after = open(layout, Party::Client)?;
+        if let Err(why) = b.anchor(layout, &mut after) {
+            eprintln!("base: no anchor after the initiation, the next record waits for it: {why}");
+            b.owe(layout)?;
+        }
+    }
     Ok(value)
 }
 
@@ -775,11 +802,22 @@ fn client_half(layout: &Layout) -> Result<MobileHalf, String> {
 ///
 /// Not initiated, refused, or the capsule does not write.
 pub fn work(layout: &Layout, text: &str) -> Result<serde_json::Value, String> {
+    // K3 (§27, `[р]` 01.11 «В»): the network's commands first.
+    crate::command::before_holder(layout, Party::Client, true)?;
+    // `light` on Base (§22, С9): a copy is refused before anything is
+    // written; past the ten offline records the record waits for an anchor.
+    let mut base = crate::base::Anchoring::begin(layout)?;
     let mut session = open(layout, Party::Client)?;
+    if let Some(b) = base.as_mut().filter(|b| b.owes()) {
+        b.anchor(layout, &mut session)?;
+    }
     let half = client_half(layout)?;
     let cmd = Request::Work { text: text.into() };
     let bytes = done(drive_until_done(layout, &mut session, &half, &cmd, 40)?)?;
     finish(layout, session)?;
+    if let Some(b) = base.as_mut() {
+        b.recorded(layout)?;
+    }
     serde_json::from_slice(&bytes).map_err(|e| format!("the page's receipt: {e}"))
 }
 
@@ -798,6 +836,8 @@ pub fn work_mobile_web(
     mobile: &mut ksg_cli_v2::web_mobile::WebMobile,
     text: &str,
 ) -> Result<serde_json::Value, String> {
+    // K3 (§27, `[р]` 01.11 «В»): the network's commands first.
+    crate::command::before_holder(layout, Party::Client, true)?;
     let mut session = open(layout, Party::Client)?;
     let cmd = Request::Work { text: text.into() };
     let bytes = done(drive_page_until_done(
@@ -1003,7 +1043,14 @@ fn round_page(
 ///
 /// Not initiated, refused, or the capsule does not write.
 pub fn export_page(layout: &Layout, number: u64, party: Party) -> Result<Vec<u8>, String> {
+    // K3 (§27, `[р]` 01.11 «В»): the network's commands first.
+    crate::command::before_holder(layout, party, false)?;
+    // A value goes out only on a fresh anchor (`light` on Base, §22, С9).
+    let mut base = crate::base::Anchoring::begin(layout)?;
     let mut session = open(layout, party)?;
+    if let Some(b) = base.as_mut() {
+        b.anchor(layout, &mut session)?;
+    }
     let bytes = match party {
         Party::Client => {
             let half = client_half(layout)?;
@@ -1034,6 +1081,8 @@ pub fn export_page_mobile_web(
     mobile: &mut ksg_cli_v2::web_mobile::WebMobile,
     number: u64,
 ) -> Result<Vec<u8>, String> {
+    // K3 (§27, `[р]` 01.11 «В»): the network's commands first.
+    crate::command::before_holder(layout, Party::Client, false)?;
     let mut session = open(layout, Party::Client)?;
     let cmd = Request::ExportPage { number };
     let bytes = done(drive_page_until_done(
@@ -1109,6 +1158,249 @@ fn write_maps(layout: &Layout, maps: &MapSeeds) -> Result<(), String> {
     owner.map = B64.encode(maps.1.as_slice());
     owner.write(&layout.owner_side())?;
     Ok(())
+}
+
+/// E-3 through the capsule (`Spec_kapsula` §19): the buyer's key is laid up
+/// to level 2 with the owner's consent, and the capsule is sealed to the
+/// buyer's map from then on — the holder's map (the issuer's) opens nothing.
+///
+/// The buyer's map is born here, at the reader that writes the buyer's file;
+/// the module gets its public half only. Before the birth the capsule has one
+/// map, so the client's file and the owner's both get the new seed (the same
+/// way `initiate` splits them later). The buyer's signature is the stand's
+/// (`stand/parties.json`, a stand key — `[р]` 25.10); the owner's comes from
+/// the owner's file. `init` is not touched: it still lays E-2 and E-3 on the
+/// stand itself.
+///
+/// The files are rewritten after the capsule, as in `initiate`: a crash
+/// between the two leaves a capsule that no file opens — print again.
+///
+/// # Errors
+///
+/// The stand carries no `parties.json`, the container is initiated already or
+/// has no packet, a signature does not come, the module refuses.
+pub fn buyer_key(layout: &Layout) -> Result<serde_json::Value, String> {
+    let seeds: Seeds = serde_json::from_slice(
+        &std::fs::read(layout.stand().join("parties.json"))
+            .map_err(|e| format!("parties.json: {e}"))?,
+    )
+    .map_err(|e| format!("parties.json: {e}"))?;
+    let parties = Parties::from_seeds(&seeds)?;
+    let (buyer, issuer) = (parties.buyer, parties.issuer);
+
+    // The buyer's map: its secret half stays here until the files are written.
+    let mut seed = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(seed.as_mut());
+    let to = OpenWith::from_bytes(*seed).seal_to();
+    let holder_map = MapPub {
+        role: "holder".into(),
+        x25519: B64.encode(to.public().as_bytes()),
+        mlkem: B64.encode(to.mlkem()),
+    };
+
+    let mut session = open(layout, Party::Client)?;
+    let request = Request::ApplyBuyerKey {
+        buyer: buyer.public(),
+        holder_map,
+    };
+    let mut bytes = None;
+    // The signatures come one by one: the buyer's, the owner's, then the
+    // issuer's over the status record that follows the key.
+    for _ in 0..8 {
+        match session.call(&request)? {
+            Answer::Done { bytes: b } => {
+                bytes = Some(b);
+                break;
+            }
+            Answer::NeedsSignature { party, bytes: msg } => {
+                let signature = match party.as_str() {
+                    "buyer" => serde_json::to_vec(&buyer.sign(&msg))
+                        .map_err(|e| format!("signature: {e}"))?,
+                    // The status record that follows the key is the issuer's.
+                    "issuer" => serde_json::to_vec(&issuer.sign(&msg))
+                        .map_err(|e| format!("signature: {e}"))?,
+                    "owner" => owner_signature(layout, &msg)?,
+                    other => return Err(format!("the {other}'s signature is needed")),
+                };
+                done(session.call(&Request::Sign { signature })?)?;
+            }
+            other => {
+                done(other)?;
+                return Err("the buyer's key is not laid".into());
+            }
+        }
+    }
+    let bytes = bytes.ok_or("the buyer's key keeps asking for signatures")?;
+    // K4 (§28): the layer key handed over to the buyer, in the same session —
+    // a later status move would leave it stale for good.
+    work_off(layout, &mut session)?;
+    finish(layout, session)?;
+    write_maps(layout, &(seed.clone(), seed))?;
+    warn_backup_stale();
+    serde_json::from_slice(&bytes).map_err(|e| format!("the status: {e}"))
+}
+
+/// E-9 through the capsule (`Spec_kapsula` §21): the owner hands the container
+/// over to a new owner — the stand's buyer (`parties.json`, a stand key,
+/// `[р]` 25.10) takes the owner's seat.
+///
+/// The new owner's map is born here, at the reader that writes the new
+/// owner's file; the module gets its public half only and seals the owner's
+/// slot to it. The former owner's map opens nothing afterwards (Н-3). The
+/// owner's file is rewritten after the capsule (as in `buyer_key`): its half
+/// becomes the new owner's key, its map seed the new one — the former seed
+/// is overwritten. A crash between the two leaves a capsule that no owner's
+/// file opens: transfer again from the backup of the file.
+///
+/// # Errors
+///
+/// The stand carries no `parties.json`, the container is not initiated or has
+/// no open journal, a signature does not come, the module refuses (a bare
+/// whose former owner's secrets are not empty).
+pub fn transfer(layout: &Layout) -> Result<serde_json::Value, String> {
+    transfer_with_evm_key(layout, None)
+}
+
+/// E-9 as [`transfer`]; on a capsule that anchors on Base the transfer goes
+/// out on a fresh anchor, and the writer's seat on the contract goes to the
+/// new owner's EVM key (`evm_key`, else `stand/new_owner_evm.key` — the
+/// issuer's desk, as the stand's `owner_change --evm-key`): handed over now if
+/// the network answers, else before the next anchor (`Spec_kapsula` §22, С9).
+///
+/// # Errors
+///
+/// As [`transfer`]; a capsule on Base without a readable key for the new
+/// owner (checked before anything is written); a copy.
+pub fn transfer_with_evm_key(
+    layout: &Layout,
+    evm_key: Option<&Path>,
+) -> Result<serde_json::Value, String> {
+    // K3 (§27, `[р]` 01.11 «В»): the network's commands first.
+    crate::command::before_holder(layout, Party::Client, true)?;
+    let mut base = crate::base::Anchoring::begin(layout)?;
+    let new_key = if base.is_some() {
+        let key = evm_key.map_or_else(|| layout.new_owner_evm_key(), Path::to_path_buf);
+        ksg_cli_v2::base_anchor::hand_to_for(&key)?;
+        Some(key)
+    } else if evm_key.is_some() {
+        return Err("transfer: --evm-key only where the capsule anchors on Base Sepolia".into());
+    } else {
+        None
+    };
+    let seeds: Seeds = serde_json::from_slice(
+        &std::fs::read(layout.stand().join("parties.json"))
+            .map_err(|e| format!("parties.json: {e}"))?,
+    )
+    .map_err(|e| format!("parties.json: {e}"))?;
+    let buyer_half = Zeroizing::new(
+        B64.decode(&seeds.buyer)
+            .map_err(|_| "parties.json: the buyer's seed is not base64url".to_string())?,
+    );
+    let parties = Parties::from_seeds(&seeds)?;
+    let buyer = parties.buyer;
+    let issuer = parties.issuer;
+
+    // The new owner's map: its secret half stays here until the file is written.
+    let mut seed = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(seed.as_mut());
+    let to = OpenWith::from_bytes(*seed).seal_to();
+    let owner_map = MapPub {
+        role: "owner".into(),
+        x25519: B64.encode(to.public().as_bytes()),
+        mlkem: B64.encode(to.mlkem()),
+    };
+
+    let mut session = open(layout, Party::Client)?;
+    let template = match base.as_mut() {
+        Some(b) => {
+            // The transfer goes out only on a fresh anchor, before the record.
+            b.anchor(layout, &mut session)?;
+            Some(crate::base::Anchoring::template(&mut session)?)
+        }
+        None => None,
+    };
+    let half = client_half(layout)?;
+    let request = Request::Transfer { new_owner: buyer.public(), owner_map };
+    let sign = |party: &str, msg: &[u8]| -> Result<Vec<u8>, String> {
+        match party {
+            "buyer" => serde_json::to_vec(&buyer.sign(msg)).map_err(|e| format!("signature: {e}")),
+            "issuer" => serde_json::to_vec(&issuer.sign(msg)).map_err(|e| format!("signature: {e}")),
+            "owner" => owner_signature(layout, msg),
+            other => Err(format!("the {other}'s signature is needed")),
+        }
+    };
+    let bytes = done(drive_signed(layout, &mut session, &half, &request, &sign, 40)?)?;
+    // K4 (§28, full ladder fix 3): the chain layer after E-9, in the same
+    // session — it holds nothing up, but it is the issuer's to write.
+    work_off(layout, &mut session)?;
+    finish(layout, session)?;
+
+    // The owner's file: the new owner's key and map. The scan key stays.
+    let mut owner = SideFile::read(&layout.owner_side())?;
+    owner.half = B64.encode(buyer_half.as_slice());
+    owner.map = B64.encode(seed.as_slice());
+    owner.write(&layout.owner_side())?;
+    warn_backup_stale();
+    if let (Some(b), Some(template), Some(key)) = (base.as_mut(), template, new_key) {
+        b.recorded(layout)?;
+        b.hand_to(layout, &template, &key)?;
+    }
+    serde_json::from_slice(&bytes).map_err(|e| format!("the status: {e}"))
+}
+
+/// Makes the signature a party's `NeedsSignature` asks for: party, bytes.
+type SignFn<'a> = dyn Fn(&str, &[u8]) -> Result<Vec<u8>, String> + 'a;
+
+/// Repeats `cmd` until it presses: as `drive_until_done`, except that each
+/// `NeedsSignature` is answered by `sign(party, bytes)` — the owner's, the
+/// arriving owner's or the issuer's — and the repeat that follows it is the
+/// command itself, not the `Sign`'s `Done`.
+///
+/// # Errors
+///
+/// A round the half refuses, a signature `sign` cannot make, an anchor the
+/// network refuses, or a press still open after `budget` turns.
+fn drive_signed(
+    layout: &Layout,
+    session: &mut Session,
+    half: &MobileHalf,
+    cmd: &Request,
+    sign: &SignFn<'_>,
+    budget: u32,
+) -> Result<Answer, String> {
+    let mut req = cmd.clone();
+    for _ in 0..budget {
+        let raw = session.call(&req)?;
+        let answer = anchor_and_reanchor(layout, session, raw, Party::Client)?;
+        match answer {
+            Answer::Done { .. } | Answer::Refused { .. } => {
+                let repeat = match req {
+                    // The round closed or dropped: a fresh one, same bytes.
+                    Request::ClientShare { .. } => true,
+                    // The signature is kept: the command repeats.
+                    Request::Sign { .. } => matches!(answer, Answer::Done { .. }),
+                    _ => false,
+                };
+                if repeat {
+                    req = cmd.clone();
+                    continue;
+                }
+                return Ok(answer);
+            }
+            Answer::NeedsClientCommit { ref round } => {
+                // A dropped round (`Refused`) opens a fresh one on the repeat.
+                round_client(session, half, round)?;
+                req = cmd.clone();
+            }
+            Answer::NeedsSignature { party, bytes } => {
+                req = Request::Sign { signature: sign(&party, &bytes)? };
+            }
+            Answer::NeedsShare { .. } | Answer::NeedsAnchor { .. } => {
+                return Err(format!("the press broke off mid-round: {answer:?}"))
+            }
+        }
+    }
+    Err("the press never closed: the signatures do not converge".into())
 }
 
 /// After `initiate` the client's file is another one (the half, the scan key):
@@ -1211,3 +1503,91 @@ pub fn restore(layout: &Layout, party: Party, from: &Path) -> Result<(), String>
         .map_err(|_| "the backup is stale: its map does not open the current capsule".to_string())?;
     file.write(&target)
 }
+
+/// Slot 2 of the coupling (E-5, CH-12): the leading container pulls
+/// `trailer`, whose last seal is `trailer_seal`. As `flow::work`: the
+/// client's press through the session's `Request::Pull`.
+///
+/// # Errors
+///
+/// Not initiated, refused, or the capsule does not write.
+pub fn pull(
+    layout: &Layout,
+    trailer: ksg_core_v2::crypto::hash::Hash,
+    trailer_seal: ksg_core_v2::crypto::hash::Hash,
+) -> Result<serde_json::Value, String> {
+    let mut base = crate::base::Anchoring::begin(layout)?;
+    let mut session = open(layout, Party::Client)?;
+    if let Some(b) = base.as_mut().filter(|b| b.owes()) {
+        b.anchor(layout, &mut session)?;
+    }
+    let half = client_half(layout)?;
+    let cmd = Request::Pull { trailer, trailer_seal };
+    let bytes = done(drive_until_done(layout, &mut session, &half, &cmd, 40)?)?;
+    finish(layout, session)?;
+    if let Some(b) = base.as_mut() {
+        b.recorded(layout)?;
+    }
+    serde_json::from_slice(&bytes).map_err(|e| format!("the page's receipt: {e}"))
+}
+
+/// K4 (`Spec_kapsula` §28): the issuer's layer work the container holds open
+/// after a sale press (E-2, E-3, E-9), done at the issuer's stand (`stand/`)
+/// and handed into `session` — call it in the same session, right after the
+/// press: a later status move leaves the follow-up stale for good.
+///
+/// # Errors
+///
+/// The stand does not open, a follow-up does not seal, the module refuses.
+pub fn work_off(layout: &Layout, session: &mut Session) -> Result<(), String> {
+    let stand = ksg_cli_v2::Reader::open(&layout.stand(), Box::new(ksg_cli_v2::mobile::NoMobile))?;
+    // Indices shift after each discharge: the list is read afresh each time.
+    for _ in 0..16 {
+        let tasks: Vec<serde_json::Value> = match session.call(&Request::PendingTasks)? {
+            Answer::Done { bytes } => serde_json::from_slice(&bytes).map_err(|e| format!("pending tasks: {e}"))?,
+            other => return Err(format!("pending tasks: {other:?}")),
+        };
+        let Some(t) = tasks.iter().find(|t| t["task"] != "carry_id") else {
+            return Ok(());
+        };
+        let index = t["index"]
+            .as_u64()
+            .and_then(|i| usize::try_from(i).ok())
+            .ok_or("pending tasks: no index")?;
+        let request = match t["task"].as_str() {
+            Some("write_layer") => {
+                let zone: ksg_container_v2::Zone =
+                    serde_json::from_value(t["zone"].clone()).map_err(|e| format!("zone: {e}"))?;
+                let position = t["position"]
+                    .as_u64()
+                    .and_then(|p| usize::try_from(p).ok())
+                    .ok_or("the zone has no free position")?;
+                let owner: Option<ksg_core_v2::crypto::sign::PublicKey> =
+                    serde_json::from_value(t["owner"].clone()).map_err(|e| format!("owner: {e}"))?;
+                Request::WriteLayer {
+                    index,
+                    sealed: stand.sealed_layer(zone, position, owner.as_ref())?,
+                }
+            }
+            Some("hand_over") => {
+                let to: ksg_core_v2::crypto::sign::PublicKey =
+                    serde_json::from_value(t["to"].clone()).map_err(|e| format!("to: {e}"))?;
+                let up_to = t["up_to"]
+                    .as_u64()
+                    .and_then(|u| u8::try_from(u).ok())
+                    .ok_or("hand-over: no level")?;
+                Request::HandedOver {
+                    index,
+                    sealed: stand.hand_over_layers(&to, ksg_container_v2::layers::Level(up_to))?,
+                }
+            }
+            other => return Err(format!("an unknown follow-up: {other:?}")),
+        };
+        match session.call(&request)? {
+            Answer::Done { .. } => {}
+            other => return Err(format!("the follow-up is not discharged: {other:?}")),
+        }
+    }
+    Err("the follow-ups do not end".into())
+}
+

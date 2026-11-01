@@ -17,6 +17,8 @@
 //! `ksg_host.random`/`now_ms` does not instantiate — WASI is not linked) and
 //! the offline half of K5 (`tests/k5_offline.rs`).
 
+pub mod base;
+pub mod command;
 pub mod engine;
 pub mod flow;
 pub mod session;

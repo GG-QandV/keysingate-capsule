@@ -4,7 +4,11 @@
 
 use ksg_capsule_reader::flow::{self, default_wasm, Layout, Print};
 use ksg_capsule_reader::side::SideFile;
-use ksg_container_v2::capsule::open_split;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine as _;
+use ksg_container_v2::capsule::{open_split, PartKind};
+use ksg_container_v2::Container;
+use ksg_core_v2::crypto::hash::Hash;
 use ksg_core_v2::doc::Class;
 
 fn home(name: &str) -> std::path::PathBuf {
@@ -50,5 +54,34 @@ fn after_the_initiation_each_party_has_its_own_map() {
         other => panic!("status: {other:?}"),
     };
     assert!(status["pages"].as_u64().unwrap_or(0) >= 2, "the owner sees the client's page: {status}");
+
+    // K2 (§26, Р-4): what the owner's map opens — the state — carries no
+    // half of the client's key; the client's part does.
+    let opened = open_split(&capsule, &owner.map().expect("a map")).expect("the owner opens");
+    let part = |kind| {
+        opened.parts.iter().find(|p| p.kind == kind).map(|p| p.bytes.clone()).expect("a part")
+    };
+    let shared: ksg_container_v2::capsule::Shared =
+        serde_json::from_slice(&part(PartKind::SharedSecrets)).expect("shared secrets");
+    let key: [u8; 32] = B64.decode(&shared.state_key).expect("base64").try_into().expect("32 bytes");
+    let template = Hash::from_multihash(&shared.template).expect("template");
+    let state = Container::open_sealed(&part(PartKind::State), &template, &key).expect("the state");
+    assert!(state.born());
+    assert!(!state.holds_client_half(), "Р-4: the owner's map gives no client's half");
+    assert!(
+        opened.parts.iter().all(|p| p.kind != PartKind::ClientSecrets),
+        "Р-4: the client's part is not the owner's"
+    );
+    let by_client = open_split(&capsule, &client.map().expect("a map")).expect("the client opens");
+    assert!(
+        by_client.parts.iter().any(|p| p.kind == PartKind::ClientSecrets && !p.bytes.is_empty()),
+        "the client's half lives in the client's part"
+    );
+
+    // The owner's session closes the capsule; the client works on after it
+    // (the half rode through in the client's part, sealed).
+    let (closed, _) = session.close().expect("the owner's session closes");
+    std::fs::write(layout.capsule(), closed).expect("the capsule");
+    flow::work(&layout, "a page after the owner's session").expect("the client works on");
     std::fs::remove_dir_all(&layout.home).ok();
 }

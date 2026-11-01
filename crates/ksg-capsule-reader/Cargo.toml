@@ -45,6 +45,13 @@ ksg-verify-v2 = { path = "../ksg-verify-v2", default-features = false, features 
 # The test stand's container: the module's own kit is private, so the reader's
 # K5 test prints through the stand exactly as `init` does.
 ksg-capsule-module = { path = "../ksg-capsule-module" }
+# K3: the network command test answers through a fake node with memos.
+bs58.workspace = true
+# C9: a Base Sepolia node in the tests — the contract runs in revm
+# (`ksg-cli-v2/tests/mock_base`, included by path).
+revm = { version = "=14.0.3", default-features = false, features = ["std"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+ksg-anchor-v2 = { path = "../ksg-anchor-v2" }
 
 [lints.rust]
 missing_docs = "warn"
