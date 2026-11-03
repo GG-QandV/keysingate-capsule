@@ -62,7 +62,7 @@
 //! The network. An anchor the container owes is the reader's work, and
 //! [`Answer::NeedsAnchor`] is how the module asks for it. Nor does the module
 //! press the commands of §5a (a command signed by a party that holds no map):
-//! that queue is post-hackathon (`TODO_na_potom.md#T2-5`); an `anchored` entry
+//! that queue is post-hackathon (tier 2); an `anchored` entry
 //! this module cannot read is an error at [`Session::open`], never a silent skip.
 
 #[cfg(not(target_arch = "wasm32"))]

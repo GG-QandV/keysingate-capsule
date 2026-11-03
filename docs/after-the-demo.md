@@ -12,7 +12,7 @@ The hackathon demo runs on the **test stand**: some keys that the product keeps 
 | 6 | Owner's approvals | — | The owner (or orchestrator) approves only global actions (initiation, transfer, declaring a key lost); writing and sealing pages is the agent's routine work and needs no human |
 | 7 | Remote signer | Local only | A network channel for agents that live in short-lived environments and for orchestrators that keep their agents' signers |
 | 8 | Anchored (Pro) run time | ~400 s on a local Solana node with a 120 s anchor wait | Profile and shorten |
-| 9 | Code comments | Partly not in English | All comments and messages in English |
+| 9 | Code comments | Done during the hackathon: all comments and messages in `crates/` are in English | — |
 | 10 | Light anchors in the written standard | The code anchors `light` minimally on Base Sepolia (birth, initiation, before a value leaves, every ten records); the published IETF draft `-00` still says `light` anchors only after it switches to Pro | Draft revision `-01` with the minimal schedule |
 
 ## Known limits — stated, not hidden
