@@ -35,7 +35,20 @@ Online: **https://capsule.keysingate.com** sends you a ready capsule and its key
 
 [`demo/capsule/`](demo/capsule) holds one real capsule and both parties' side files (a throw-away demo; the keys are public on purpose). Its [README](demo/capsule/README.md) walks you through it: build, look at the 6 MiB of noise, write a page as the client agent, export it, check it offline — ACCEPTED — and change one bit — REJECTED.
 
-A ready-made binary: the [`bare-beta-1` release](https://github.com/GG-QandV/keysingate-capsule/releases/tag/bare-beta-1) (`ksg-capsule` for **Linux x86_64** (glibc 2.34 or newer), **macOS** (Apple Silicon, Intel, universal) and **Windows x86_64**, with `SHA256SUMS`; the macOS and Windows files are not code-signed). Step by step for each system, and how to build it yourself: [docs/quickstart.md](docs/quickstart.md). ARM Linux and other systems: build from source (below).
+## Download the controller (`ksg-capsule`) — pick your system
+
+All files are in the [`bare-beta-1` release](https://github.com/GG-QandV/keysingate-capsule/releases/tag/bare-beta-1); `SHA256SUMS` lists every file. Step by step for each system, and how to build it yourself: [docs/quickstart.md](docs/quickstart.md).
+
+| Your system | File | Download |
+|---|---|---|
+| Linux x86_64 (glibc 2.34 or newer: Ubuntu 22.04+, Debian 12+) | `ksg-capsule-linux-x86_64` | [download](https://github.com/GG-QandV/keysingate-capsule/releases/download/bare-beta-1/ksg-capsule-linux-x86_64) |
+| macOS, Apple Silicon (M1 and newer) | `ksg-capsule-macos-arm64` | [download](https://github.com/GG-QandV/keysingate-capsule/releases/download/bare-beta-1/ksg-capsule-macos-arm64) |
+| macOS, Intel | `ksg-capsule-macos-x86_64` | [download](https://github.com/GG-QandV/keysingate-capsule/releases/download/bare-beta-1/ksg-capsule-macos-x86_64) |
+| macOS, either (both architectures in one file) | `ksg-capsule-macos-universal` | [download](https://github.com/GG-QandV/keysingate-capsule/releases/download/bare-beta-1/ksg-capsule-macos-universal) |
+| Windows 10/11, 64-bit | `ksg-capsule-windows-x86_64.exe` | [download](https://github.com/GG-QandV/keysingate-capsule/releases/download/bare-beta-1/ksg-capsule-windows-x86_64.exe) |
+| Checksums | `SHA256SUMS` | [download](https://github.com/GG-QandV/keysingate-capsule/releases/download/bare-beta-1/SHA256SUMS) |
+
+The macOS and Windows files are not code-signed: the system may warn on the first start; [docs/quickstart.md](docs/quickstart.md) says what to do. They were smoke-tested on GitHub-hosted Windows and Apple Silicon runners (the Intel Mac file was not run on an Intel Mac). ARM Linux and other systems: build from source (below).
 
 ## Build and test
 
