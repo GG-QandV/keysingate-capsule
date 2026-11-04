@@ -14,6 +14,7 @@
 
 Each claim of the demo, and where to see it: [`demo/CLAIMS.md`](demo/CLAIMS.md). What the demo does not cover yet, and
 the known limits: [`docs/after-the-demo.md`](docs/after-the-demo.md).
+**Get a capsule online, free:** [capsule.keysingate.com](https://capsule.keysingate.com) — enter an e-mail and receive a ready, initiated `bare` capsule and its two keys in two e-mails (beta; the tool to open it is a Linux x86_64 release, see below).
 The capsule file was also checked as a whole for noise-likeness and for code or format patterns (entropy, chi-square, runs, compression, signature and repeat search against an `os.urandom` control; no structure found, limits stated): [`docs/noise-check.md`](docs/noise-check.md).
 
 ## Built during the hackathon
@@ -29,6 +30,8 @@ The capsule file was also checked as a whole for noise-likeness and for code or 
 | ▶️ | The whole insurance scene ([`demo/case_4417.md`](demo/case_4417.md)) with one command, the agent reached through an ACP-A2A gateway | [`scripts/demo_orchestrator.sh`](scripts/demo_orchestrator.sh) |
 
 ## Open a capsule yourself
+
+Online: **https://capsule.keysingate.com** sends you a ready capsule and its keys by e-mail. To try without e-mail, use the demo capsule below.
 
 [`demo/capsule/`](demo/capsule) holds one real capsule and both parties' side files (a throw-away demo; the keys are public on purpose). Its [README](demo/capsule/README.md) walks you through it: build, look at the 6 MiB of noise, write a page as the client agent, export it, check it offline — ACCEPTED — and change one bit — REJECTED.
 
