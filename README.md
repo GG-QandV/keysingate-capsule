@@ -5,8 +5,9 @@
 > **Built during the hackathon** (after the kickoff ended on 26 Oct 2026, 12:24 PM ET): the **capsule** — a sealed
 > container for an AI agent's work record with no doors. It is one fixed-size 6 MiB file that looks like noise; nothing
 > inside can be pulled out, and it answers only through its own buttons: a signed export and a status. An agent built on
-> **Muse Spark** writes every step of its work into the capsule as a signed page; every model call and every **SAM 3.1**
-> image mask becomes a page too; anyone can check the exported pages offline.
+> **Muse Spark** writes every step of its work into the capsule as a signed page; each model call made through the
+> capsule's tool and each **SAM 3.1** image mask becomes a page too; anyone can check the exported pages offline.
+> The demo uses a synthetic insurance claim: it is not insurance advice, and a human expert verifies the pages.
 >
 > **Pre-existing:** the Keys in Gate core existed before the hackathon and is used here as a library
 > ([`keysingate/keysingate-core`](https://github.com/keysingate/keysingate-core)) — see [below](#pre-existing-work-a-library).
@@ -30,6 +31,8 @@ The capsule file was also checked as a whole for noise-likeness and for code or 
 ## Open a capsule yourself
 
 [`demo/capsule/`](demo/capsule) holds one real capsule and both parties' side files (a throw-away demo; the keys are public on purpose). Its [README](demo/capsule/README.md) walks you through it: build, look at the 6 MiB of noise, write a page as the client agent, export it, check it offline — ACCEPTED — and change one bit — REJECTED.
+
+A ready-made binary: the [`bare-beta-1` release](https://github.com/keysingate/keysingate-capsule/releases/tag/bare-beta-1) (`ksg-capsule`, **Linux x86_64 only**, glibc 2.34 or newer, with `SHA256SUMS`). On any other system, build from source (below).
 
 ## Build and test
 
