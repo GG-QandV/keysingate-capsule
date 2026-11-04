@@ -35,7 +35,7 @@ Online: **https://capsule.keysingate.com** sends you a ready capsule and its key
 
 [`demo/capsule/`](demo/capsule) holds one real capsule and both parties' side files (a throw-away demo; the keys are public on purpose). Its [README](demo/capsule/README.md) walks you through it: build, look at the 6 MiB of noise, write a page as the client agent, export it, check it offline — ACCEPTED — and change one bit — REJECTED.
 
-A ready-made binary: the [`bare-beta-1` release](https://github.com/keysingate/keysingate-capsule/releases/tag/bare-beta-1) (`ksg-capsule`, **Linux x86_64 only**, glibc 2.34 or newer, with `SHA256SUMS`). On any other system, build from source (below).
+A ready-made binary: the [`bare-beta-1` release](https://github.com/GG-QandV/keysingate-capsule/releases/tag/bare-beta-1) (`ksg-capsule`, **Linux x86_64 only**, glibc 2.34 or newer, with `SHA256SUMS`). On any other system, build from source (below).
 
 ## Build and test
 
