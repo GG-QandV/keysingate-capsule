@@ -1,0 +1,74 @@
+# Builds the ksg-capsule controller for Windows and macOS and smoke-tests it on real runners.
+# Manual only (workflow_dispatch): no run on push. Test capsule: demo/capsule (throw-away, public keys).
+name: build-desktop
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "git ref to build (tag or branch)"
+        default: "main"
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.ref }}" }
+      - run: cargo build --release --locked -p ksg-capsule-reader --bin ksg-capsule
+      - run: |
+          mkdir out
+          copy target\release\ksg-capsule.exe out\ksg-capsule-windows-x86_64.exe
+        shell: cmd
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: out/* }
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.ref }}" }
+      - run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --locked -p ksg-capsule-reader --bin ksg-capsule --target aarch64-apple-darwin
+          cargo build --release --locked -p ksg-capsule-reader --bin ksg-capsule --target x86_64-apple-darwin
+          mkdir out
+          cp target/aarch64-apple-darwin/release/ksg-capsule out/ksg-capsule-macos-arm64
+          cp target/x86_64-apple-darwin/release/ksg-capsule out/ksg-capsule-macos-x86_64
+          lipo -create -output out/ksg-capsule-macos-universal out/ksg-capsule-macos-arm64 out/ksg-capsule-macos-x86_64
+          chmod +x out/*
+      - uses: actions/upload-artifact@v4
+        with: { name: macos, path: out/* }
+  test-windows:
+    needs: windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.ref }}" }
+      - uses: actions/download-artifact@v4
+        with: { name: windows, path: bin }
+      - shell: bash
+        run: |
+          set -ex
+          B=./bin/ksg-capsule-windows-x86_64.exe
+          cp -r demo/capsule t
+          $B --home t status
+          $B --home t work "windows smoke page"
+          $B --home t export-page 1 --by owner
+          $B --home t status
+  test-macos:
+    needs: macos
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.ref }}" }
+      - uses: actions/download-artifact@v4
+        with: { name: macos, path: bin }
+      - run: |
+          set -ex
+          chmod +x bin/*
+          for v in arm64 universal; do
+            rm -rf t && cp -R demo/capsule t
+            B=./bin/ksg-capsule-macos-$v
+            $B --home t status
+            $B --home t work "macos $v smoke page"
+            $B --home t export-page 1 --by owner
+            $B --home t status
+          done
