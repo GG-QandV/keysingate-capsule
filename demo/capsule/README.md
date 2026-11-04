@@ -50,7 +50,8 @@ $V --export $H/mine.json --container "$ID" --class light --keys $H/keys.json    
 The pages already here check the same way: `$V --export demo/capsule/page-1.json --container "$ID" --class light --keys demo/capsule/keys.json`.
 
 ## 6. Change one byte, see it refused
-The page's text is stored base64-encoded inside the export; flip one bit of it:
+The page's text is stored base64-encoded inside the export; flip one bit of it. The path below fits a page written by
+`work` (step 5); other pages, such as page 1 (the opening), have another shape:
 ```bash
 python3 - "$H/mine.json" <<'PY'
 import base64, json, sys

@@ -1,6 +1,6 @@
 # How the capsule was built
 
-Each line is a commit of the capsule crates in the development repository (date, commit, subject); the same steps are this repository's history.
+Each line is a commit of the capsule crates in the development repository (date, commit, subject); the hashes are those of the development repository; the history of this repository holds the same steps rebuilt with other hashes.
 
 ```
 2026-10-26 2910a85 Capsule skeleton: capsule.rs (blocks, maps, parts), module crate (WASM boundary, host randomness), reader crate (atomic write); K1-K5 tests ignored until their days (plan v8)

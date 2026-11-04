@@ -1,5 +1,9 @@
 # `bare` — the private class of container
 
+> **Which tool.** This page describes the `bare` class as the core implements it. The command lines with
+> `ksg-remote-panel` (`attach-to`, `detach`, `export-page --number 1,2,3`) belong to the core's panel, which is not part of
+> this repository. Here the tool is `ksg-capsule` (see the README): its `export-page N` writes **one** page per call.
+
 `bare` is one of the three emission classes of a KeysInGate container, the
 smallest of them. It is meant for work that stays with its holder: a personal
 journal, an agent's own record, an internal chain of hand-overs. It proves who

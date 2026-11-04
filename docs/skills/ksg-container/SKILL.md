@@ -5,6 +5,10 @@ description: Work with a bare KeysInGate container through the ksg MCP tools —
 
 # ksg-container (bare) — draft
 
+> **Two tools, two repositories.** This draft was written for the `ksg` MCP tools of the core repository: the paths
+> `core-v2/…` and the panel commands (`--number`, `attach-to`, `detach`, "export 1–24 pages at once") belong to the core's
+> panel `ksg-remote-panel`. In this repository the capsule is driven by `ksg-capsule`: `export-page N` writes one page.
+
 Work with a `bare` container only through the `ksg` MCP tools
 (`core-v2/scripts/ksg_mcp.py`).
 
