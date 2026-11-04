@@ -14,7 +14,7 @@
 
 Each claim of the demo, and where to see it: [`demo/CLAIMS.md`](demo/CLAIMS.md). What the demo does not cover yet, and
 the known limits: [`docs/after-the-demo.md`](docs/after-the-demo.md).
-**Get a capsule online, free:** [capsule.keysingate.com](https://capsule.keysingate.com) — enter an e-mail and receive a ready, initiated `bare` capsule and its two keys in two e-mails (beta; the tool to open it is a Linux x86_64 release, see below).
+**Get a capsule online, free:** [capsule.keysingate.com](https://capsule.keysingate.com) — enter an e-mail and receive a ready, initiated `bare` capsule and its two keys in two e-mails (beta; the tool to open it is a release for Linux, macOS or Windows, see [docs/quickstart.md](docs/quickstart.md)).
 The capsule file was also checked as a whole for noise-likeness and for code or format patterns (entropy, chi-square, runs, compression, signature and repeat search against an `os.urandom` control; no structure found, limits stated): [`docs/noise-check.md`](docs/noise-check.md).
 
 ## Built during the hackathon
@@ -35,7 +35,7 @@ Online: **https://capsule.keysingate.com** sends you a ready capsule and its key
 
 [`demo/capsule/`](demo/capsule) holds one real capsule and both parties' side files (a throw-away demo; the keys are public on purpose). Its [README](demo/capsule/README.md) walks you through it: build, look at the 6 MiB of noise, write a page as the client agent, export it, check it offline — ACCEPTED — and change one bit — REJECTED.
 
-A ready-made binary: the [`bare-beta-1` release](https://github.com/GG-QandV/keysingate-capsule/releases/tag/bare-beta-1) (`ksg-capsule`, **Linux x86_64 only**, glibc 2.34 or newer, with `SHA256SUMS`). On any other system, build from source (below).
+A ready-made binary: the [`bare-beta-1` release](https://github.com/GG-QandV/keysingate-capsule/releases/tag/bare-beta-1) (`ksg-capsule` for **Linux x86_64** (glibc 2.34 or newer), **macOS** (Apple Silicon, Intel, universal) and **Windows x86_64**, with `SHA256SUMS`; the macOS and Windows files are not code-signed). Step by step for each system, and how to build it yourself: [docs/quickstart.md](docs/quickstart.md). ARM Linux and other systems: build from source (below).
 
 ## Build and test
 
