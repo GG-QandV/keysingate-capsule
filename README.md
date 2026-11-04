@@ -13,6 +13,7 @@
 
 Each claim of the demo, and where to see it: [`demo/CLAIMS.md`](demo/CLAIMS.md). What the demo does not cover yet, and
 the known limits: [`docs/after-the-demo.md`](docs/after-the-demo.md).
+The capsule file was also checked as a whole for noise-likeness and for code or format patterns (entropy, chi-square, runs, compression, signature and repeat search against an `os.urandom` control; no structure found, limits stated): [`docs/noise-check.md`](docs/noise-check.md).
 
 ## Built during the hackathon
 
